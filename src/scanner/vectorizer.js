@@ -35,6 +35,16 @@ const SELECTOR_CATEGORIES = {
   claim:       ['4e71d92d', 'aad3ec96', '2e7ba6ef', '379607f5'],
 };
 
+// Dead/zero addresses for ownership classification
+const DEAD_ADDRESSES = new Set([
+  '0x0000000000000000000000000000000000000000',
+  '0x000000000000000000000000000000000000dead',
+  '0x0000000000000000000000000000000000000001',
+]);
+
+// Exploit severity encoding
+const SEVERITY_ENCODING = { critical: 1.0, high: 0.7, medium: 0.4, low: 0.1 };
+
 class Vectorizer {
   constructor(outputDir) {
     this.outputDir = outputDir;
@@ -95,6 +105,34 @@ class Vectorizer {
     features.push(contract.withdrawRevertsForCaller ? 1 : 0);           // 36: withdraw/exit reverts for our address
     features.push(logNormalize(contract.callerBalanceInContract || 0));  // 37: our balanceOf() in the contract (log-normalized)
 
+    // --- Ownership status features (indices 38-41) ---
+    // From storage analysis: who owns this contract and what does that imply?
+    const owner = (contract.owner || '').toLowerCase();
+    const deployer = (contract.deployer || '').toLowerCase();
+    features.push(owner === '0x' + '0'.repeat(40) ? 1 : 0);            // 38: owner is zero address (renounced)
+    features.push(DEAD_ADDRESSES.has(owner) && owner !== '0x' + '0'.repeat(40) ? 1 : 0); // 39: owner is dead/burn address
+    features.push(owner && deployer && owner === deployer ? 1 : 0);     // 40: owner == deployer
+    features.push(contract.ownerIsEOA ? 1 : 0);                        // 41: owner is an EOA (not a contract)
+
+    // --- Exploit pattern features (indices 42-48) ---
+    // From exploit-patterns.js analysis results
+    const exploits = contract.exploitResults || {};
+    features.push(exploits.reinitializable ? 1 : 0);                    // 42: initialize() callable (re-init attack)
+    features.push(exploits.hasCreate2 ? 1 : 0);                         // 43: CREATE2 metamorphic potential
+    features.push(exploits.delegatecallExploitable ? 1 : 0);            // 44: user-controlled delegatecall target
+    features.push(exploits.txOriginAuth ? 1 : 0);                       // 45: tx.origin auth bypass
+    features.push(exploits.uncheckedReturn ? 1 : 0);                    // 46: unchecked ERC-20 transfer returns
+    features.push(exploits.unprotectedOwner ? 1 : 0);                   // 47: unprotected storage slot 0 owner
+    features.push(encodeExploitSeverity(exploits.maxSeverity));          // 48: worst exploit severity (0-1)
+
+    // --- Deployer profile features (indices 49-52) ---
+    // From chain-analyst: deployer behavior predicts contract abandonment
+    const dep = contract.deployerProfile || {};
+    features.push(normalize(dep.nonce || 0, 0, 10000));                  // 49: deployer nonce (serial deployer detection)
+    features.push(normalize(dep.dormancyDays || 0, 0, 730));             // 50: days since deployer's last tx (0-2 years)
+    features.push(normalize(dep.contractCount || 0, 0, 500));            // 51: number of contracts deployed
+    features.push(dep.isContract ? 1 : 0);                              // 52: deployer is a contract (factory deployment)
+
     // Labels (for supervised training)
     const labels = {
       hasValue: ethBal > 0 || Object.keys(tokenBals).length > 0,
@@ -102,6 +140,11 @@ class Vectorizer {
       treasure: contract.treasure || false,
       ethValue: ethBal,
       proxyType: contract.proxyType || 'none',
+      // Enriched labels from team findings
+      ownershipStatus: classifyOwnership(owner, deployer, contract),
+      exploitDetected: Object.values(exploits).some(v => v === true),
+      maxExploitSeverity: exploits.maxSeverity || 'none',
+      deployerDormant: (dep.dormancyDays || 0) > 180,
     };
 
     // Raw selector hashes for learned embedding (bag-of-selectors input).
@@ -180,4 +223,18 @@ function encodeProxyType(type) {
   return types[type] || 0;
 }
 
-module.exports = { Vectorizer, SELECTOR_CATEGORIES };
+// Encode worst exploit severity as a float
+function encodeExploitSeverity(severity) {
+  return SEVERITY_ENCODING[severity] || 0;
+}
+
+// Classify ownership status for enriched labels
+function classifyOwnership(owner, deployer, contract) {
+  if (!owner || owner === '0x' + '0'.repeat(40)) return 'renounced';
+  if (DEAD_ADDRESSES.has(owner)) return 'burned';
+  if (owner && deployer && owner === deployer) return 'deployer_owned';
+  if (contract.ownerIsEOA) return 'eoa_owned';
+  return 'contract_owned';
+}
+
+module.exports = { Vectorizer, SELECTOR_CATEGORIES, DEAD_ADDRESSES };

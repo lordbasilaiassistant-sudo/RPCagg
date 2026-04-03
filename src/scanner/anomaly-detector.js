@@ -452,12 +452,14 @@ class AnomalyDetector {
   }
 
   _extractSelectors(bytecodeHex) {
-    const ops = disassemble(bytecodeHex);
+    // Use regex on raw hex — same approach as treasure-hunt.js.
+    // Pattern: PUSH4 <4 bytes> EQ => 63 XX XX XX XX 14
+    const hex = bytecodeHex.toLowerCase().replace('0x', '');
     const selectors = new Set();
-    for (let i = 0; i < ops.length - 1; i++) {
-      if (ops[i].opcode === 0x63 && ops[i].pushData && ops[i + 1]?.opcode === 0x14) {
-        selectors.add(ops[i].pushData.toString('hex'));
-      }
+    const regex = /63([0-9a-f]{8})14/g;
+    let match;
+    while ((match = regex.exec(hex)) !== null) {
+      selectors.add(match[1]);
     }
     return [...selectors];
   }

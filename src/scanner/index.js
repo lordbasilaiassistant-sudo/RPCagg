@@ -38,6 +38,7 @@ module.exports = {
   BEACON_SLOT,
   analyzeExploitPatterns,
   quickBytecodeFlags,
+  AnomalyDetector,
   extractOpcodes,
   computeNgrams,
   jaccardSimilarity,

@@ -23,14 +23,16 @@ const KNOWN_SELECTORS = new Set(
   Object.values(SELECTOR_CATEGORIES).flat()
 );
 
-// Weights for each dimension (tuned by hand, will be replaced by NN weights after training)
+// Weights for each dimension (tuned by hand, will be replaced by NN weights after training).
+// Correlation audit: anomaly and vulnerability were r=0.93 (redundant), merged into
+// "risk" dimension. access and mev have r=-0.60 (anti-correlated by design — known
+// extraction functions reduce obscurity). All remaining pairs |r| < 0.5.
 const WEIGHTS = {
   value: 3.0,
-  access: 2.5,
-  anomaly: 1.5,
+  access: 2.0,
+  risk: 2.0,    // merged anomaly + vulnerability — structural weirdness AND exploitability
   age: 1.0,
-  vulnerability: 2.0,
-  mev: 2.5,  // MEV competition adjustment — boost obscure targets, penalize obvious ones
+  mev: 2.5,     // MEV competition adjustment — boost obscure targets, penalize obvious ones
 };
 
 // Known high-value extraction selectors (ordered by extraction likelihood)
@@ -60,9 +62,8 @@ class Scorer {
     const scores = {
       value: this._valueScore(contract),
       access: this._accessScore(contract),
-      anomaly: this._anomalyScore(contract),
+      risk: this._riskScore(contract),
       age: this._ageScore(contract),
-      vulnerability: this._vulnerabilityScore(contract),
       mev: this._mevScore(contract),
     };
 
@@ -133,26 +134,52 @@ class Scorer {
     return Math.min(1, score / 20);
   }
 
-  _anomalyScore(c) {
-    let anomaly = 0;
+  /**
+   * Risk score — merged anomaly + vulnerability into one dimension.
+   *
+   * Correlation audit showed anomaly and vulnerability at r=0.93 (nearly
+   * identical signal from overlapping features). Merging eliminates the
+   * redundancy and gives the power mean one clean "how risky/unusual is this
+   * contract" dimension instead of two correlated ones that inflate scores.
+   *
+   * Sub-signals (structural weirdness):
+   *   - Unusual code size
+   *   - Very few selectors
+   *   - High code-to-selector ratio (obfuscated?)
+   *   - No owner function on a funded contract
+   *
+   * Sub-signals (exploit potential):
+   *   - Uninitialized proxy
+   *   - Selfdestruct + value
+   *   - Factory + value (CREATE2 re-deploy)
+   *   - Upgradeable + value
+   *   - Renounced ownership + value
+   *   - Non-standard delegatecall
+   */
+  _riskScore(c) {
+    let risk = 0;
 
-    // Unusual code size (very small or very large)
-    if (c.codeSize && (c.codeSize < 100 || c.codeSize > 30000)) anomaly += 0.2;
-
-    // Has selfdestruct
-    if (c.hasSelfdestruct) anomaly += 0.3;
-
-    // Is a proxy but implementation slot is empty (uninitialized?)
-    if (c.isProxy && !c.implementation) anomaly += 0.4;
-
-    // Very few selectors (possibly a bare vault)
-    if (c.selectors && c.selectors.length <= 3) anomaly += 0.2;
-
-    // Has value but no owner function (might be ownerless)
+    // --- Structural weirdness ---
+    if (c.codeSize && (c.codeSize < 100 || c.codeSize > 30000)) risk += 0.15;
+    if (c.selectors && c.selectors.length <= 3) risk += 0.1;
     const hasOwner = c.selectors?.includes('8da5cb5b');
-    if (c.ethBalance > 0n && !hasOwner) anomaly += 0.3;
+    if (c.ethBalance > 0n && !hasOwner) risk += 0.15;
+    if (c.codeSize && c.selectors) {
+      const ratio = c.selectors.length / (c.codeSize / 1000);
+      if (ratio < 0.5 && c.codeSize > 1000) risk += 0.1;
+    }
 
-    return Math.min(1, anomaly);
+    // --- Exploit potential ---
+    if (c.isProxy && !c.implementation) risk += 0.2;
+    if (c.hasSelfdestruct && c.ethBalance > 0n) risk += 0.15;
+    if (c.isFactory && c.ethBalance > 0n) risk += 0.1;
+    const hasUpgrade = c.selectors?.includes('3659cfe6');
+    if (hasUpgrade && c.ethBalance > 0n) risk += 0.1;
+    const hasRenounce = c.selectors?.includes('715018a6');
+    if (hasRenounce && c.ethBalance > 0n) risk += 0.1;
+    if (c.hasDelegatecall && !c.isProxy) risk += 0.1;
+
+    return Math.min(1, risk);
   }
 
   _ageScore(c) {
@@ -170,28 +197,7 @@ class Scorer {
     return Math.min(1.0, Math.pow(Math.max(0, age / maxAge), 0.3));
   }
 
-  _vulnerabilityScore(c) {
-    let vuln = 0;
-
-    // Uninitialized proxy
-    if (c.isProxy && !c.implementation) vuln += 0.5;
-
-    // Has selfdestruct + value
-    if (c.hasSelfdestruct && c.ethBalance > 0n) vuln += 0.4;
-
-    // Factory with value (might have CREATE2 drain)
-    if (c.isFactory && c.ethBalance > 0n) vuln += 0.2;
-
-    // Has transferOwnership + value
-    const hasTransferOwner = c.selectors?.includes('f2fde38b');
-    if (hasTransferOwner && c.ethBalance > 0n) vuln += 0.3;
-
-    // Has renounceOwnership (owner gave up control — who has it now?)
-    const hasRenounce = c.selectors?.includes('715018a6');
-    if (hasRenounce) vuln += 0.1;
-
-    return Math.min(1, vuln);
-  }
+  // _vulnerabilityScore merged into _riskScore — see correlation audit (Task #25).
 
   /**
    * MEV Competition Score — models the likelihood that this opportunity has NOT

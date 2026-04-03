@@ -13,7 +13,7 @@ Architecture:
   - Log-cosh loss for value regression (robust to outliers)
   - Combined anomaly score from reconstruction error + prediction disagreement
 
-Input: 38-dim feature vector from vectorizer.js (35 original + 3 transfer verification)
+Input: 53-dim feature vector from vectorizer.js (38 original + 4 ownership + 7 exploit + 4 deployer)
 Output: dict of per-task predictions + anomaly score
 
 Designed for real-time inference on every new contract (~0.1ms per forward pass).
@@ -249,16 +249,26 @@ class TreasureNet(nn.Module):
     Multi-task network for contract treasure detection.
 
     Architecture:
-        Input (38-dim features + variable-length selector list)
-            --> Feature Group Encoders (5 fixed groups) --> [160-dim]
+        Input (53-dim features + variable-length selector list)
+            --> Feature Group Encoders (8 fixed groups) --> [256-dim]
             --> Selector Embedding (bag-of-selectors, learned) --> [32-dim]
-            --> Concat --> [192-dim]
-            --> Shared Encoder (3 residual blocks, 192-dim)
-                --> Autoencoder Decoder --> reconstruction (38-dim) [anomaly]
+            --> Concat --> [288-dim]
+            --> Shared Encoder (3 residual blocks, 288-dim)
+                --> Autoencoder Decoder --> reconstruction (53-dim) [anomaly]
                 --> Value Head --> log(ETH + 1) prediction [regression]
                 --> Extraction Head --> P(extraction success) [binary]
                 --> Treasure Head --> P(treasure) [binary]
                 --> Transfer Head --> P(net positive ETH transfer) [binary]
+
+    Feature groups:
+        - Structural (0-9): code size, proxy, factory, selfdestruct, deploy info
+        - Financial (10-16): ETH/token balances
+        - Capability (17-30): legacy selector category buckets
+        - Extraction (31-34): sim results, treasure flag
+        - Transfer verification (35-37): gas patterns, revert check, caller balance
+        - Ownership (38-41): owner status (zero/dead/deployer/EOA)
+        - Exploit (42-48): vulnerability patterns from exploit-patterns.js
+        - Deployer (49-52): deployer nonce, dormancy, contract count
 
     The selector embedding replaces hardcoded category buckets as the primary
     capability signal. Any 4-byte selector hashes into a learned embedding —
@@ -269,7 +279,7 @@ class TreasureNet(nn.Module):
         1. Anomaly score = reconstruction error (unusual contracts reconstruct poorly)
         2. Regularization (forces shared encoder to preserve all information)
 
-    Parameters: ~230K (<0.1ms inference on CPU)
+    Parameters: ~380K (<0.1ms inference on CPU)
     """
 
     # Feature group slicing indices (matching vectorizer.js)
@@ -278,12 +288,15 @@ class TreasureNet(nn.Module):
     CAPABILITY = (17, 31)      # indices 17-30 (legacy category buckets, still used by autoencoder)
     EXTRACTION = (31, 35)      # indices 31-34
     TRANSFER_VERIF = (35, 38)  # indices 35-37 (gas pattern, revert check, caller balance)
+    OWNERSHIP = (38, 42)       # indices 38-41 (zero/dead/deployer/EOA owner)
+    EXPLOIT = (42, 49)         # indices 42-48 (reinit, CREATE2, delegatecall, txorigin, unchecked, unprotected, severity)
+    DEPLOYER = (49, 53)        # indices 49-52 (nonce, dormancy, contract count, isContract)
 
     GROUP_EMBED_DIM = 32       # Each group encodes to 32-dim
-    SHARED_DIM = 192           # 5 fixed groups * 32 + 1 selector embed * 32 = 192
+    SHARED_DIM = 288           # 8 fixed groups * 32 + 1 selector embed * 32 = 288
     NUM_RESIDUAL = 3
 
-    def __init__(self, input_dim: int = 38, dropout: float = 0.15):
+    def __init__(self, input_dim: int = 53, dropout: float = 0.15):
         super().__init__()
         self.input_dim = input_dim
 
@@ -293,6 +306,9 @@ class TreasureNet(nn.Module):
         self.capability_enc = FeatureGroupEncoder(14, self.GROUP_EMBED_DIM, dropout)
         self.extraction_enc = FeatureGroupEncoder(4, self.GROUP_EMBED_DIM, dropout)
         self.transfer_verif_enc = FeatureGroupEncoder(3, self.GROUP_EMBED_DIM, dropout)
+        self.ownership_enc = FeatureGroupEncoder(4, self.GROUP_EMBED_DIM, dropout)
+        self.exploit_enc = FeatureGroupEncoder(7, self.GROUP_EMBED_DIM, dropout)
+        self.deployer_enc = FeatureGroupEncoder(4, self.GROUP_EMBED_DIM, dropout)
 
         # --- Learned selector embedding (variable-length bag-of-selectors) ---
         self.selector_emb = SelectorEmbedding(
@@ -369,7 +385,7 @@ class TreasureNet(nn.Module):
         Encode raw features + optional selector lists into shared representation.
 
         Args:
-            x: [B, 38] fixed feature vectors
+            x: [B, 53] fixed feature vectors
             selector_lists: optional list of B selector int lists/tensors.
                            If None, uses only the legacy capability features.
         """
@@ -378,6 +394,9 @@ class TreasureNet(nn.Module):
         c = self.capability_enc(x[:, self.CAPABILITY[0]:self.CAPABILITY[1]])
         e = self.extraction_enc(x[:, self.EXTRACTION[0]:self.EXTRACTION[1]])
         t = self.transfer_verif_enc(x[:, self.TRANSFER_VERIF[0]:self.TRANSFER_VERIF[1]])
+        o = self.ownership_enc(x[:, self.OWNERSHIP[0]:self.OWNERSHIP[1]])
+        xp = self.exploit_enc(x[:, self.EXPLOIT[0]:self.EXPLOIT[1]])
+        d = self.deployer_enc(x[:, self.DEPLOYER[0]:self.DEPLOYER[1]])
 
         if selector_lists is not None:
             sel = self.selector_emb(selector_lists)  # [B, 32]
@@ -386,7 +405,7 @@ class TreasureNet(nn.Module):
             # Use a zero embedding — the legacy capability features still carry signal.
             sel = torch.zeros(x.shape[0], self.GROUP_EMBED_DIM, device=x.device)
 
-        fused = torch.cat([s, f, c, e, t, sel], dim=-1)  # [B, 192]
+        fused = torch.cat([s, f, c, e, t, o, xp, d, sel], dim=-1)  # [B, 288]
         return self.shared(fused)
 
     def forward(self, x: torch.Tensor,
@@ -401,8 +420,8 @@ class TreasureNet(nn.Module):
         transfer_logit = self.transfer_head(z).squeeze(-1)
 
         return {
-            'z': z,                                         # Shared embedding [B, 192]
-            'reconstruction': reconstruction,               # Decoded features [B, 38]
+            'z': z,                                         # Shared embedding [B, 288]
+            'reconstruction': reconstruction,               # Decoded features [B, 53]
             'recon_error': recon_error,                     # Per-sample MSE [B]
             'value_pred': value_pred,                       # log(ETH+1) estimate [B]
             'extraction_logit': extraction_logit,           # Raw logit [B]
@@ -445,8 +464,10 @@ class ContractDataset(torch.utils.data.Dataset):
     """
     Loads JSONL vectors from the vectorizer.
 
-    Each line: {"address":"0x...", "features":[...38 floats...], "selectorHashes":[...ints...], "labels":{...}}
+    Each line: {"address":"0x...", "features":[...53 floats...], "selectorHashes":[...ints...], "labels":{...}}
     """
+
+    TARGET_DIM = 53
 
     def __init__(self, jsonl_path: str):
         import json
@@ -461,10 +482,10 @@ class ContractDataset(torch.utils.data.Dataset):
                     continue
                 obj = json.loads(line)
                 raw_features = obj['features']
-                # Pad old 35-dim vectors to 38-dim (transfer verification features default to 0)
-                if len(raw_features) < 38:
-                    raw_features = raw_features + [0.0] * (38 - len(raw_features))
-                features = torch.tensor(raw_features[:38], dtype=torch.float32)
+                # Pad old vectors to 53-dim (new features default to 0)
+                if len(raw_features) < self.TARGET_DIM:
+                    raw_features = raw_features + [0.0] * (self.TARGET_DIM - len(raw_features))
+                features = torch.tensor(raw_features[:self.TARGET_DIM], dtype=torch.float32)
                 labels = obj.get('labels', {})
                 # transfer_verified: true only if treasure=true AND no false positive category
                 # (meaning extraction calls actually move value to the caller)
@@ -529,9 +550,12 @@ class FeatureAugmentor:
     Binary features (indices 1, 2, 4, 5, 11, 16, 34, 36) are never augmented.
     """
 
-    BINARY_INDICES = [1, 2, 4, 5, 11, 16, 34, 36]
-    DIM = 38
-    CONTINUOUS_INDICES = [i for i in range(38) if i not in {1, 2, 4, 5, 11, 16, 34, 36}]
+    # Binary features: structural booleans (1,2,4,5), financial flags (11,16),
+    # treasure flag (34), withdraw reverts (36), ownership booleans (38-41),
+    # exploit booleans (42-47), deployer isContract (52)
+    BINARY_INDICES = [1, 2, 4, 5, 11, 16, 34, 36, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 52]
+    DIM = 53
+    CONTINUOUS_INDICES = [i for i in range(53) if i not in {1, 2, 4, 5, 11, 16, 34, 36, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 52}]
 
     @staticmethod
     def add_noise(features: torch.Tensor, std: float = 0.02) -> torch.Tensor:
@@ -998,7 +1022,7 @@ class TreasureDetector:
     def load(cls, path: str, device: str = 'cpu') -> 'TreasureDetector':
         """Load a trained model from disk."""
         checkpoint = torch.load(path, map_location=device, weights_only=True)
-        model = TreasureNet()
+        model = TreasureNet(input_dim=53)
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
@@ -1008,10 +1032,11 @@ class TreasureDetector:
     @torch.no_grad()
     def predict(self, features, selector_hashes=None) -> Dict:
         """
-        Predict on a single 38-dim feature vector with optional selector hashes.
+        Predict on a single 53-dim feature vector with optional selector hashes.
+        Backward compatible: auto-pads shorter vectors to 53-dim.
 
         Args:
-            features: 38-element list/array/tensor
+            features: 53-element list/array/tensor (or shorter, auto-padded)
             selector_hashes: optional list of int selector hashes for this contract
 
         Returns dict with all predictions + boolean flags for each alert type.
@@ -1020,6 +1045,10 @@ class TreasureDetector:
             features = torch.tensor(features, dtype=torch.float32)
         if features.dim() == 1:
             features = features.unsqueeze(0)
+        # Auto-pad shorter vectors to 53-dim
+        if features.shape[-1] < 53:
+            pad = torch.zeros(features.shape[0], 53 - features.shape[-1])
+            features = torch.cat([features, pad], dim=-1)
 
         features = features.to(self.device)
         sel_lists = [selector_hashes or []]
@@ -1078,6 +1107,10 @@ class TreasureDetector:
         """Predict on a batch of feature vectors with optional selector hashes."""
         if isinstance(features, (list, np.ndarray)):
             features = torch.tensor(features, dtype=torch.float32)
+        # Auto-pad shorter vectors to 53-dim
+        if features.shape[-1] < 53:
+            pad = torch.zeros(features.shape[0], 53 - features.shape[-1])
+            features = torch.cat([features, pad], dim=-1)
         features = features.to(self.device)
         out = self.model(features, selector_hash_lists)
 

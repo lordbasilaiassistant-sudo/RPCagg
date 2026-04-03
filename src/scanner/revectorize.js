@@ -79,8 +79,8 @@ function revectorize(inputPath, outputPath) {
       }
     }
 
-    // Pad to 38 dims if needed (old vectors are 35-dim)
-    while (features.length < 38) {
+    // Pad to 53 dims if needed (old vectors are 35/38-dim, new features default to 0)
+    while (features.length < 53) {
       features.push(0);
     }
     vector.dim = features.length;
