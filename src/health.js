@@ -157,7 +157,7 @@ class HealthChecker {
     this._handleRateLimit({ name: providerName }, s);
   }
 
-  // Called by router to record request latency from actual traffic
+  // Called by router to update latency from successful traffic
   recordLatency(providerName, latency) {
     const s = this.state.get(providerName);
     if (!s) return;
@@ -165,8 +165,11 @@ class HealthChecker {
       ? latency
       : s.smoothedLatency * (1 - LATENCY_EWMA_ALPHA) + latency * LATENCY_EWMA_ALPHA;
     s.latency = latency;
+    // Only update counters for router-originated requests (not health checks)
     s.totalRequests++;
     s.totalSuccess++;
+    // Clear failure streak on success
+    if (s.failures > 0) s.failures = 0;
   }
 
   // Called by router to record a failure
@@ -264,8 +267,16 @@ class HealthChecker {
     return stats;
   }
 
+  // Internal — returns live mutable state (used by router/strategies)
   getState(name) {
     return this.state.get(name);
+  }
+
+  // External — returns read-only snapshot (safe for tests/monitoring)
+  getSnapshot(name) {
+    const s = this.state.get(name);
+    if (!s) return null;
+    return { ...s };
   }
 }
 

@@ -167,6 +167,8 @@ tests.sustained = async () => {
   console.log('  Window    | RPS   | Errors | Avg    | p95    | p99');
   console.log('  ----------|-------|--------|--------|--------|-------');
 
+  const startTime = Date.now();
+
   async function worker() {
     while (running) {
       const r = await fireAt(baseUrl, rpc('eth_blockNumber'));
@@ -191,7 +193,6 @@ tests.sustained = async () => {
     }
   }
 
-  const startTime = Date.now();
   const workers = Array.from({ length: CONCURRENCY }, () => worker());
   await Promise.all(workers);
 

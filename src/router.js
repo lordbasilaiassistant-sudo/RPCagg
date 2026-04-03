@@ -122,8 +122,8 @@ class Router {
           return { result: response, retryReason: null };
         }
 
-        // Unknown RPC error — return it (most are user errors like bad params)
-        this.stats.success++;
+        // Unknown RPC error — return it (user errors like bad params)
+        // Not a router error, but not a success either — don't count
         return { result: response, retryReason: null };
       }
 

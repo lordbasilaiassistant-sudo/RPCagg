@@ -1,9 +1,12 @@
 /**
  * Strategy: Weighted Round Robin
  * Cycles through available providers, weighted by their configured weight.
- * Respects exclude set.
+ * Respects exclude set. Index state is per-module (singleton pattern matches
+ * the Router's single-strategy-at-a-time design).
  */
 
+// Atomic index — safe because Node.js is single-threaded.
+// All async concurrency yields at await points, not mid-increment.
 let index = 0;
 
 function select(providers, healthChecker, excludeSet = new Set()) {
@@ -17,9 +20,13 @@ function select(providers, healthChecker, excludeSet = new Set()) {
     for (let i = 0; i < count; i++) pool.push(p);
   }
 
+  if (pool.length === 0) return null;
   const pick = pool[index % pool.length];
-  index = (index + 1) % pool.length;
+  index = (index + 1) % Number.MAX_SAFE_INTEGER;
   return pick;
 }
 
-module.exports = { name: 'round-robin', select };
+// Allow resetting index for testing
+function reset() { index = 0; }
+
+module.exports = { name: 'round-robin', select, reset };
