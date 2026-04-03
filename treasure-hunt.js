@@ -26,7 +26,7 @@ const RPC = process.env.RPC_URL || 'http://127.0.0.1:8545';
 const DATA_DIR = path.join(__dirname, 'data');
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const ZERO_ADDR = '0x' + '0'.repeat(40);
-const OUR_WALLET = '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
+const OUR_WALLET = process.env.EXECUTOR_WALLET || '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
 
 // Known ERC-20s on Base with liquidity
 const TOP_TOKENS = [
@@ -136,34 +136,48 @@ class TreasureHunter {
 
   async findDeployments(startBlock, endBlock) {
     const deployments = [];
-    const BATCH = 10;
+    const BATCH = 50;       // blocks per RPC batch
+    const CONCURRENCY = 5;  // parallel batches
 
+    // Build all chunk ranges
+    const chunks = [];
     for (let b = startBlock; b <= endBlock; b += BATCH) {
-      const end = Math.min(b + BATCH - 1, endBlock);
-      const calls = [];
-      for (let i = b; i <= end; i++) {
-        calls.push({ method: 'eth_getBlockByNumber', params: [`0x${i.toString(16)}`, true] });
-      }
+      chunks.push([b, Math.min(b + BATCH - 1, endBlock)]);
+    }
 
-      const blocks = await this.rpc.batch(calls);
+    // Process chunks with concurrency
+    for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+      const wave = chunks.slice(i, i + CONCURRENCY);
 
-      for (const block of blocks) {
-        if (!block || block.error || !block.transactions) continue;
-        for (const tx of block.transactions) {
-          if (tx.to === null && typeof tx === 'object') {
-            deployments.push({
-              txHash: tx.hash,
-              deployer: tx.from,
-              blockNumber: parseInt(block.number, 16),
-              timestamp: parseInt(block.timestamp, 16),
-              value: tx.value,
-            });
+      const waveResults = await Promise.all(wave.map(async ([from, to]) => {
+        const calls = [];
+        for (let b = from; b <= to; b++) {
+          calls.push({ method: 'eth_getBlockByNumber', params: [`0x${b.toString(16)}`, true] });
+        }
+        return this.rpc.batch(calls);
+      }));
+
+      for (const blocks of waveResults) {
+        for (const block of blocks) {
+          if (!block || block.error || !block.transactions) continue;
+          for (const tx of block.transactions) {
+            if (tx.to === null && typeof tx === 'object') {
+              deployments.push({
+                txHash: tx.hash,
+                deployer: tx.from,
+                blockNumber: parseInt(block.number, 16),
+                timestamp: parseInt(block.timestamp, 16),
+                value: tx.value,
+              });
+            }
           }
         }
       }
 
-      if ((b - startBlock) % 100 === 0) {
-        log.info(`  scanned blocks ${b}-${end} | ${deployments.length} deploys found`);
+      const blocksScanned = Math.min((i + CONCURRENCY) * BATCH, endBlock - startBlock);
+      if (i % 5 === 0) {
+        const pct = ((blocksScanned / (endBlock - startBlock)) * 100).toFixed(1);
+        log.info(`  ${pct}% | block ~${startBlock + blocksScanned} | ${deployments.length} deploys`);
       }
     }
 

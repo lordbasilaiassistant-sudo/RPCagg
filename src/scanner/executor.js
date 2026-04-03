@@ -17,7 +17,7 @@ const log = makeLogger('executor');
 
 const EXECUTE_LIVE = process.env.EXECUTE === '1';
 const MIN_PROFIT_WEI = BigInt(process.env.MIN_PROFIT_WEI || '100000000000000'); // 0.0001 ETH default
-const TREASURY = '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
+const TREASURY = process.env.EXECUTOR_WALLET || '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
 
 class Executor {
   constructor(rpcClient) {
@@ -124,10 +124,29 @@ class Executor {
     if (result.profitable && EXECUTE_LIVE) {
       log.info(`EXECUTING: ${fnName} on ${target} (profit: ${result.profitEth} ETH)`);
       try {
+        // Pre-execution balance snapshot
+        const balBefore = BigInt(await this.rpc.call('eth_getBalance', [TREASURY, 'latest']));
+
         result.txHash = await this._executeLive(target, callData, result.gasEstimate);
-        result.executed = true;
-        this.executed.push(result);
         log.info(`TX SENT: ${result.txHash}`);
+
+        // Wait for receipt and verify
+        const receipt = await this._waitForReceipt(result.txHash);
+        if (receipt && receipt.status === '0x1') {
+          const balAfter = BigInt(await this.rpc.call('eth_getBalance', [TREASURY, 'latest']));
+          const netGain = balAfter - balBefore;
+          result.executed = true;
+          result.verified = true;
+          result.netGain = netGain.toString();
+          result.netGainEth = Number(netGain) / 1e18;
+          this.executed.push(result);
+          log.info(`VERIFIED: net gain ${result.netGainEth} ETH`);
+        } else {
+          result.executed = true;
+          result.verified = false;
+          result.error = 'tx reverted on-chain';
+          log.error(`TX REVERTED: ${result.txHash}`);
+        }
       } catch (err) {
         result.error = `execution failed: ${err.message}`;
         log.error(`EXECUTION FAILED: ${err.message}`);
@@ -142,10 +161,10 @@ class Executor {
 
   async _executeLive(target, callData, gasEstimate) {
     // This requires a signed transaction — we need the private key
-    // Using THRYXTREASURY_PRIVATE_KEY env var
-    const privKey = process.env.THRYXTREASURY_PRIVATE_KEY;
+    // Using EXECUTOR_SIGNER_KEY env var
+    const privKey = process.env.EXECUTOR_SIGNER_KEY;
     if (!privKey) {
-      throw new Error('THRYXTREASURY_PRIVATE_KEY not set — cannot sign transaction');
+      throw new Error('EXECUTOR_SIGNER_KEY not set — cannot sign transaction');
     }
 
     // Build raw transaction params
@@ -176,6 +195,18 @@ class Executor {
     // Send via aggregator (which will pick the best provider)
     const txHash = await this.rpc.call('eth_sendRawTransaction', [signed]);
     return txHash;
+  }
+
+  async _waitForReceipt(txHash, maxWait = 60000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      try {
+        const receipt = await this.rpc.call('eth_getTransactionReceipt', [txHash]);
+        if (receipt) return receipt;
+      } catch (e) { /* not mined yet */ }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    return null;
   }
 
   getReport() {
