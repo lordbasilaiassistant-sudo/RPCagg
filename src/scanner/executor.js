@@ -19,6 +19,12 @@ const EXECUTE_LIVE = process.env.EXECUTE === '1';
 const MIN_PROFIT_WEI = BigInt(process.env.MIN_PROFIT_WEI || '100000000000000'); // 0.0001 ETH default
 const TREASURY = process.env.EXECUTOR_WALLET || '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
 
+// Gas threshold for view function detection.
+// View/pure functions cost ~21000 gas (base tx cost) because they don't write storage.
+// Real extraction functions (withdraw, transfer, sweep) always cost significantly more
+// due to SSTORE, SLOAD, LOG, and ETH transfer opcodes.
+const VIEW_GAS_CEILING = 26000;
+
 class Executor {
   constructor(rpcClient) {
     this.rpc = rpcClient;
@@ -93,7 +99,17 @@ class Executor {
       return result;
     }
 
-    // Step 2b: Verify the function actually SENDS us ETH (not just succeeds)
+    // Step 2b: Filter view/pure functions by gas pattern.
+    // View functions cost ~21000 gas (base tx cost only) — no storage writes.
+    // Real extraction functions always cost more due to SSTORE/LOG/CALL opcodes.
+    if (result.gasEstimate <= VIEW_GAS_CEILING) {
+      result.error = `filtered: gas estimate ${result.gasEstimate} <= ${VIEW_GAS_CEILING} (likely view/pure function)`;
+      result.simSuccess = false;
+      this.simulated.push(result);
+      return result;
+    }
+
+    // Step 2c: Verify the function actually SENDS us ETH (not just succeeds)
     // Check if the contract balance decreases or our balance increases after sim
     // Filter out deposit/receive/fallback functions — these take ETH, not give it
     const depositSelectors = ['d0e30db0', 'b6b55f25', 'e8eda9df']; // deposit(), deposit(uint256)

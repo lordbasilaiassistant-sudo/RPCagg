@@ -37,7 +37,9 @@ const TOP_TOKENS = [
   { symbol: 'cbETH', addr: '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22' },
 ];
 
-// Known "money extraction" selectors
+// Known "money extraction" selectors — state-changing functions that move value.
+// View functions (owner, renounceOwnership, increaseAllowance, transferOwnership)
+// are excluded: they succeed in eth_call but never transfer ETH/tokens.
 const EXTRACTION_SELECTORS = {
   '3ccfd60b': 'withdraw()',
   '2e1a7d4d': 'withdraw(uint256)',
@@ -49,8 +51,6 @@ const EXTRACTION_SELECTORS = {
   '00f714ce': 'withdrawToken(uint256,address)',
   'a9059cbb': 'transfer(address,uint256)',
   '23b872dd': 'transferFrom(address,address,uint256)',
-  '39509351': 'increaseAllowance(address,uint256)',
-  'f2fde38b': 'transferOwnership(address)',
   'e9fad8ee': 'exit()',
   'db2e21bc': 'emergencyWithdraw()',
   '5312ea8e': 'emergencyWithdraw(uint256)',
@@ -61,10 +61,6 @@ const EXTRACTION_SELECTORS = {
   '6ea056a9': 'sweep(address,uint256)',
   '7df73e27': 'rescue(address)',
   '38e771ab': 'rescue()',
-  'b6b55f25': 'deposit(uint256)',
-  'd0e30db0': 'deposit()',
-  '8da5cb5b': 'owner()',
-  '715018a6': 'renounceOwnership()',
   '00000000': 'receive()/fallback',
 };
 
@@ -186,26 +182,40 @@ class TreasureHunter {
 
   async resolveAddresses(deployments) {
     const contracts = [];
-    const BATCH = 25;
+    const BATCH = 50;       // receipts per batch
+    const CONCURRENCY = 5;  // parallel batches
 
+    const chunks = [];
     for (let i = 0; i < deployments.length; i += BATCH) {
-      const chunk = deployments.slice(i, i + BATCH);
-      const calls = chunk.map(d => ({
-        method: 'eth_getTransactionReceipt',
-        params: [d.txHash],
+      chunks.push(deployments.slice(i, i + BATCH));
+    }
+
+    for (let ci = 0; ci < chunks.length; ci += CONCURRENCY) {
+      const wave = chunks.slice(ci, ci + CONCURRENCY);
+
+      const waveResults = await Promise.all(wave.map(async (chunk) => {
+        const calls = chunk.map(d => ({
+          method: 'eth_getTransactionReceipt',
+          params: [d.txHash],
+        }));
+        return { chunk, receipts: await this.rpc.batch(calls) };
       }));
 
-      const receipts = await this.rpc.batch(calls);
+      for (const { chunk, receipts } of waveResults) {
+        for (let j = 0; j < chunk.length; j++) {
+          const receipt = receipts[j];
+          if (!receipt || receipt.error || !receipt.contractAddress) continue;
 
-      for (let j = 0; j < chunk.length; j++) {
-        const receipt = receipts[j];
-        if (!receipt || receipt.error || !receipt.contractAddress) continue;
+          contracts.push({
+            ...chunk[j],
+            address: receipt.contractAddress,
+            gasUsed: parseInt(receipt.gasUsed, 16),
+          });
+        }
+      }
 
-        contracts.push({
-          ...chunk[j],
-          address: receipt.contractAddress,
-          gasUsed: parseInt(receipt.gasUsed, 16),
-        });
+      if (ci % 5 === 0 && ci > 0) {
+        log.info(`  resolved ${contracts.length}/${deployments.length} addresses`);
       }
     }
 
@@ -221,7 +231,7 @@ class TreasureHunter {
       params: [c.address, 'latest'],
     }));
 
-    const ethBals = await this.rpc.batchChunked(ethCalls, 50);
+    const ethBals = await this.rpc.batchChunked(ethCalls, 100);
 
     for (let i = 0; i < contracts.length; i++) {
       const bal = ethBals[i];
@@ -285,7 +295,7 @@ class TreasureHunter {
   }
 
   async analyzeContracts(contracts) {
-    const BATCH = 20;
+    const BATCH = 50;
 
     for (let i = 0; i < contracts.length; i += BATCH) {
       const chunk = contracts.slice(i, i + BATCH);
