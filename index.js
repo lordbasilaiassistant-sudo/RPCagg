@@ -11,6 +11,7 @@
  * Then point your tools at: http://localhost:8545
  */
 
+const config = require('./src/config');
 const { providers } = require('./src/providers');
 const { HealthChecker } = require('./src/health');
 const { Router } = require('./src/router');
@@ -19,42 +20,31 @@ const { makeLogger, setLevel } = require('./src/logger');
 
 const log = makeLogger('main');
 
-const PORT = parseInt(process.env.PORT || '8545', 10);
-const STRATEGY = process.env.STRATEGY || 'fastest';
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+setLevel(config.logLevel);
 
-setLevel(LOG_LEVEL);
-
-// Boot
 log.info(`RPC Aggregator starting`);
-log.info(`providers: ${providers.length} | strategy: ${STRATEGY} | port: ${PORT}`);
+log.info(`providers: ${providers.length} | strategy: ${config.strategy} | port: ${config.port}`);
 
 const healthChecker = new HealthChecker(providers);
-const router = new Router(healthChecker, STRATEGY);
+const router = new Router(healthChecker, config.strategy);
 const app = createServer(router, healthChecker);
 
 healthChecker.start();
 
-const HOST = process.env.HOST || '127.0.0.1';
-const server = app.listen(PORT, HOST, () => {
-  log.info(`listening on http://${HOST}:${PORT}`);
-  log.info(`point ethers/viem/curl at http://localhost:${PORT}`);
-  log.info(`status: http://localhost:${PORT}/health`);
-  log.info(`stats:  http://localhost:${PORT}/stats`);
+const server = app.listen(config.port, config.host, () => {
+  log.info(`listening on http://${config.host}:${config.port}`);
+  log.info(`status: http://localhost:${config.port}/health`);
+  log.info(`stats:  http://localhost:${config.port}/stats`);
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+function shutdown() {
   log.info('shutting down...');
   healthChecker.stop();
   server.close(() => process.exit(0));
-});
-
-process.on('SIGTERM', () => {
-  log.info('shutting down...');
-  healthChecker.stop();
-  server.close(() => process.exit(0));
-});
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 // Export for programmatic use in other projects
-module.exports = { healthChecker, router, app };
+module.exports = { healthChecker, router, app, config };

@@ -12,10 +12,11 @@
 
 const strategies = require('./strategies');
 const { makeLogger } = require('./logger');
+const config = require('./config');
 const log = makeLogger('router');
 
-const MAX_RETRIES = 4;
-const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_RETRIES = config.maxRetries;
+const REQUEST_TIMEOUT_MS = config.requestTimeoutMs;
 
 const PERMANENT_ERRORS = [
   'execution reverted',

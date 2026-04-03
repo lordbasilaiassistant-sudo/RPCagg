@@ -5,10 +5,11 @@
 
 const express = require('express');
 const { makeLogger } = require('./logger');
+const config = require('./config');
 const log = makeLogger('server');
 
-const MAX_INFLIGHT = parseInt(process.env.MAX_INFLIGHT || '200', 10);
-const MAX_BATCH = parseInt(process.env.MAX_BATCH || '500', 10);
+const MAX_INFLIGHT = config.maxInflight;
+const MAX_BATCH = config.maxBatch;
 
 // Allowed RPC methods — blocks admin/debug/personal by default.
 // Deep scanning methods (debug_*, trace_*) enabled via env flag.
@@ -41,12 +42,11 @@ const DEEP_METHODS = new Set([
   'trace_replayTransaction', 'trace_filter', 'trace_call',
 ]);
 
-if (process.env.ENABLE_DEEP === '1') {
+if (config.enableDeep) {
   for (const m of DEEP_METHODS) ALLOWED_METHODS.add(m);
 }
 
-// Also allow eth_sendRawTransaction if explicitly enabled
-if (process.env.ENABLE_SEND === '1') {
+if (config.enableSend) {
   ALLOWED_METHODS.add('eth_sendRawTransaction');
 }
 

@@ -5,16 +5,17 @@
  */
 
 const { makeLogger } = require('./logger');
+const config = require('./config');
 const log = makeLogger('health');
 
-const HEALTH_INTERVAL_MS = 10_000;       // check every 10s
-const UNHEALTHY_THRESHOLD_MS = 5_000;    // >5s response = unhealthy
-const CONSECUTIVE_FAILURES = 3;          // 3 fails in a row = mark down
-const RECOVERY_SUCCESSES = 2;            // 2 successes to recover
-const RATE_LIMIT_COOLDOWN_MS = 30_000;   // 30s cooldown after 429
-const RATE_LIMIT_BACKOFF_MULT = 2;       // exponential backoff multiplier
-const MAX_COOLDOWN_MS = 300_000;         // max 5 min cooldown
-const LATENCY_EWMA_ALPHA = 0.3;         // smoothing factor for latency tracking
+const HEALTH_INTERVAL_MS = config.healthIntervalMs;
+const UNHEALTHY_THRESHOLD_MS = config.unhealthyThresholdMs;
+const CONSECUTIVE_FAILURES = config.consecutiveFailures;
+const RECOVERY_SUCCESSES = config.recoverySuccesses;
+const RATE_LIMIT_COOLDOWN_MS = config.rateLimitCooldownMs;
+const RATE_LIMIT_BACKOFF_MULT = config.rateLimitBackoffMult;
+const MAX_COOLDOWN_MS = config.maxCooldownMs;
+const LATENCY_EWMA_ALPHA = 0.3;
 
 class HealthChecker {
   constructor(providers) {

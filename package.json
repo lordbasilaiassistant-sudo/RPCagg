@@ -8,7 +8,12 @@
     "start:race": "STRATEGY=race node index.js",
     "start:robin": "STRATEGY=round-robin node index.js",
     "start:debug": "LOG_LEVEL=debug node index.js",
-    "test": "node test.js"
+    "start:deep": "ENABLE_DEEP=1 node index.js",
+    "test": "node test.js && node test-scanner.js",
+    "test:agg": "node test.js",
+    "test:scanner": "node test-scanner.js",
+    "test:battle": "node battle-test.js",
+    "scan": "node scan.js"
   },
   "keywords": ["rpc", "aggregator", "base", "ethereum", "proxy"],
   "author": "drlor",
