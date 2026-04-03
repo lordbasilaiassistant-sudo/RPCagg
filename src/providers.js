@@ -7,30 +7,46 @@
 const BASE_CHAIN_ID = 8453;
 
 const providers = [
-  // Tier 1 — reliable, high limits
-  { name: 'base-official',  url: 'https://mainnet.base.org',                               weight: 10, maxConcurrent: 15 },
-  { name: 'ankr',           url: 'https://rpc.ankr.com/base',                              weight: 8,  maxConcurrent: 12 },
-  { name: 'publicnode',     url: 'https://base-rpc.publicnode.com',                         weight: 8,  maxConcurrent: 8  },
-  { name: 'blast-api',      url: 'https://base-mainnet.public.blastapi.io',                weight: 8,  maxConcurrent: 10 },
-  { name: 'llamanodes',     url: 'https://base.llamarpc.com',                              weight: 8,  maxConcurrent: 10 },
-  { name: 'drpc',           url: 'https://base.drpc.org',                                  weight: 7,  maxConcurrent: 10 },
+  // Tier 1 — reliable, high limits, fast (<150ms)
+  { name: 'base-official',    url: 'https://mainnet.base.org',                               weight: 10, maxConcurrent: 15 },
+  { name: 'publicnode',       url: 'https://base-rpc.publicnode.com',                         weight: 8,  maxConcurrent: 8  },
+  { name: 'blast-api',        url: 'https://base-mainnet.public.blastapi.io',                weight: 8,  maxConcurrent: 10 },
+  { name: 'llamanodes',       url: 'https://base.llamarpc.com',                              weight: 8,  maxConcurrent: 10 },
+  { name: 'drpc',             url: 'https://base.drpc.org',                                  weight: 7,  maxConcurrent: 10 },
+  { name: 'base-dev',         url: 'https://developer-access-mainnet.base.org',              weight: 8,  maxConcurrent: 10 }, // NEW — Coinbase official alt, ~106ms
+  { name: 'tenderly-pub',     url: 'https://gateway.tenderly.co/public/base',                weight: 8,  maxConcurrent: 10 }, // NEW — Tenderly public gateway, ~82ms, no key
 
   // Tier 2 — good, moderate limits
-  { name: 'blockpi',        url: 'https://base.blockpi.network/v1/rpc/public',             weight: 7,  maxConcurrent: 8  },
-  { name: '1rpc',           url: 'https://1rpc.io/base',                                   weight: 6,  maxConcurrent: 8  },
-  { name: 'lavanet',        url: 'https://base.lava.build',                                weight: 6,  maxConcurrent: 8  },
-  { name: 'meowrpc',        url: 'https://base.meowrpc.com',                               weight: 5,  maxConcurrent: 6  },
-  { name: 'thirdweb',       url: 'https://base.rpc.thirdweb.com',                          weight: 5,  maxConcurrent: 6  },
-  { name: 'nodies',         url: 'https://base-mainnet.nodies.app',                        weight: 5,  maxConcurrent: 6  },
-  { name: 'tenderly',       url: 'https://base.gateway.tenderly.co',                       weight: 5,  maxConcurrent: 6  },
+  { name: 'blockpi',          url: 'https://base.public.blockpi.network/v1/rpc/public',     weight: 7,  maxConcurrent: 8  }, // FIXED URL — old base.blockpi.network is dead (521)
+  { name: '1rpc',             url: 'https://1rpc.io/base',                                   weight: 6,  maxConcurrent: 8  },
+  { name: 'lavanet',          url: 'https://base.lava.build',                                weight: 6,  maxConcurrent: 8  },
+  { name: 'meowrpc',          url: 'https://base.meowrpc.com',                               weight: 5,  maxConcurrent: 6  },
+  { name: 'thirdweb',         url: 'https://base.rpc.thirdweb.com',                          weight: 5,  maxConcurrent: 6  },
+  { name: 'tenderly',         url: 'https://base.gateway.tenderly.co',                       weight: 5,  maxConcurrent: 6  },
+  { name: 'onfinality',       url: 'https://base.api.onfinality.io/public',                  weight: 6,  maxConcurrent: 8  }, // NEW — OnFinality, ~123ms, archive node, debug on paid
+  { name: 'sequence',         url: 'https://nodes.sequence.app/base',                        weight: 7,  maxConcurrent: 8  }, // NEW — Sequence/Horizon, ~130ms, HAS debug_trace!
+  { name: 'merkle',           url: 'https://base.merkle.io',                                 weight: 6,  maxConcurrent: 8  }, // NEW — Merkle, ~152ms, reliable
+  { name: 'sentio',           url: 'https://rpc.sentio.xyz/base',                            weight: 5,  maxConcurrent: 6  }, // NEW — Sentio, ~158ms, debug on paid tier
+  { name: 'nodies-public',    url: 'https://base-public.nodies.app',                         weight: 6,  maxConcurrent: 8  }, // NEW — Nodies public variant, ~170ms (replaces dead base-mainnet.nodies.app)
+  { name: 'nodies-pokt',      url: 'https://base-pokt.nodies.app',                           weight: 6,  maxConcurrent: 8  }, // NEW — Nodies POKT-backed, ~170ms
+  { name: 'bloxroute',        url: 'https://base.rpc.blxrbdn.com',                           weight: 6,  maxConcurrent: 6  }, // NEW — bloXroute, ~142ms, MEV-aware
 
-  // Tier 3 — usable, lower limits or less reliable
-  { name: 'publicnode-alt', url: 'https://base.publicnode.com',                             weight: 5,  maxConcurrent: 6  },
-  { name: 'unifra',         url: 'https://base-mainnet.unifra.io',                         weight: 4,  maxConcurrent: 5  },
-  { name: 'stackup',        url: 'https://public.stackup.sh/api/v1/node/base-mainnet',    weight: 4,  maxConcurrent: 5  },
-  { name: 'chainnodes',     url: 'https://base-mainnet.chainnodes.org',                    weight: 4,  maxConcurrent: 5  },
-  { name: 'allnodes',       url: 'https://base-mainnet-rpc.allthatnode.com',               weight: 4,  maxConcurrent: 5  },
-  { name: 'tatum',          url: 'https://base-mainnet.gateway.tatum.io',                  weight: 3,  maxConcurrent: 4  },
+  // Tier 3 — usable, higher latency or lower limits
+  { name: 'publicnode-alt',   url: 'https://base.publicnode.com',                             weight: 5,  maxConcurrent: 6  },
+  { name: 'subquery',         url: 'https://base.rpc.subquery.network/public',                weight: 5,  maxConcurrent: 6  }, // NEW — SubQuery decentralized, ~280ms
+  { name: 'pocket',           url: 'https://base.api.pocket.network',                         weight: 5,  maxConcurrent: 6  }, // NEW — Pocket Network, ~320ms, no key, decentralized
+  { name: 'polkachu',         url: 'https://base-rpc.polkachu.com',                           weight: 5,  maxConcurrent: 6  }, // NEW — Polkachu, ~320ms, community-run
+  { name: 'zan',              url: 'https://api.zan.top/base-mainnet',                        weight: 4,  maxConcurrent: 5  }, // NEW — ZAN (Ant Group), ~1032ms, higher latency
+  { name: 'particle',         url: 'https://rpc.particle.network/evm-chain/public?chainId=8453', weight: 4, maxConcurrent: 5 }, // NEW — Particle Network, ~522ms
+  { name: 'tatum',            url: 'https://base-mainnet.gateway.tatum.io',                  weight: 3,  maxConcurrent: 4  },
+
+  // DEAD/BROKEN — removed from active rotation (kept as comments for reference)
+  // { name: 'ankr',        url: 'https://rpc.ankr.com/base',                  — BROKEN: returns 401 "must authenticate" (no longer free) },
+  // { name: 'unifra',      url: 'https://base-mainnet.unifra.io',             — DEAD: no response },
+  // { name: 'stackup',     url: 'https://public.stackup.sh/api/v1/node/base-mainnet', — DEAD: no response },
+  // { name: 'chainnodes',  url: 'https://base-mainnet.chainnodes.org',        — DEAD: returns 404 },
+  // { name: 'allnodes',    url: 'https://base-mainnet-rpc.allthatnode.com',   — DEAD: no response },
+  // { name: 'nodies-old',  url: 'https://base-mainnet.nodies.app',            — DEAD: no response (replaced by base-public.nodies.app) },
 ];
 
 // Deduplicate by URL (keep highest weight)
