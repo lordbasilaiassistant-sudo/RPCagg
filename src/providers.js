@@ -1,35 +1,36 @@
 /**
  * RPC Provider Registry
  * Add/remove/configure Base mainnet RPC endpoints here.
- * Each provider has a name, url, and optional weight (higher = preferred).
+ * Each provider has a name, url, weight (higher = preferred), and per-provider limits.
  */
 
 const BASE_CHAIN_ID = 8453;
 
 const providers = [
-  // -- Public RPCs --
-  { name: 'base-official', url: 'https://mainnet.base.org', weight: 10 },
-  { name: 'base-official-8453', url: 'https://base.meowrpc.com', weight: 5 },
-  { name: 'ankr', url: 'https://rpc.ankr.com/base', weight: 8 },
-  { name: 'publicnode', url: 'https://base-rpc.publicnode.com', weight: 8 },
-  { name: 'blockpi', url: 'https://base.blockpi.network/v1/rpc/public', weight: 7 },
-  { name: 'drpc', url: 'https://base.drpc.org', weight: 7 },
-  { name: '1rpc', url: 'https://1rpc.io/base', weight: 6 },
-  { name: 'lavanet', url: 'https://base.lava.build', weight: 6 },
-  { name: 'unifra', url: 'https://base-mainnet.unifra.io', weight: 5 },
-  { name: 'pokt', url: 'https://base-mainnet.gateway.pokt.network/v1/lb/dead', weight: 3 },
-  { name: 'cloudflare-web3', url: 'https://base.gateway.tenderly.co', weight: 5 },
-  { name: 'blast-api', url: 'https://base-mainnet.public.blastapi.io', weight: 7 },
-  { name: 'thirdweb', url: 'https://base.rpc.thirdweb.com', weight: 5 },
-  { name: 'llamanodes', url: 'https://base.llamarpc.com', weight: 7 },
-  { name: 'base-sepolia-alt', url: 'https://base.meowrpc.com', weight: 4 },
-  { name: 'stackup', url: 'https://public.stackup.sh/api/v1/node/base-mainnet', weight: 5 },
-  { name: 'chainnodes', url: 'https://base-mainnet.chainnodes.org', weight: 5 },
-  { name: 'superchain', url: 'https://mainnet.base.org', weight: 4 },
-  { name: 'gitcoin', url: 'https://base.publicnode.com', weight: 6 },
-  { name: 'nodies', url: 'https://base-mainnet.nodies.app', weight: 5 },
-  { name: 'allnodes', url: 'https://base-mainnet-rpc.allthatnode.com', weight: 5 },
-  { name: 'tatum', url: 'https://base-mainnet.gateway.tatum.io', weight: 4 },
+  // Tier 1 — reliable, high limits
+  { name: 'base-official',  url: 'https://mainnet.base.org',                               weight: 10, maxConcurrent: 15 },
+  { name: 'ankr',           url: 'https://rpc.ankr.com/base',                              weight: 8,  maxConcurrent: 12 },
+  { name: 'publicnode',     url: 'https://base-rpc.publicnode.com',                         weight: 8,  maxConcurrent: 8  },
+  { name: 'blast-api',      url: 'https://base-mainnet.public.blastapi.io',                weight: 8,  maxConcurrent: 10 },
+  { name: 'llamanodes',     url: 'https://base.llamarpc.com',                              weight: 8,  maxConcurrent: 10 },
+  { name: 'drpc',           url: 'https://base.drpc.org',                                  weight: 7,  maxConcurrent: 10 },
+
+  // Tier 2 — good, moderate limits
+  { name: 'blockpi',        url: 'https://base.blockpi.network/v1/rpc/public',             weight: 7,  maxConcurrent: 8  },
+  { name: '1rpc',           url: 'https://1rpc.io/base',                                   weight: 6,  maxConcurrent: 8  },
+  { name: 'lavanet',        url: 'https://base.lava.build',                                weight: 6,  maxConcurrent: 8  },
+  { name: 'meowrpc',        url: 'https://base.meowrpc.com',                               weight: 5,  maxConcurrent: 6  },
+  { name: 'thirdweb',       url: 'https://base.rpc.thirdweb.com',                          weight: 5,  maxConcurrent: 6  },
+  { name: 'nodies',         url: 'https://base-mainnet.nodies.app',                        weight: 5,  maxConcurrent: 6  },
+  { name: 'tenderly',       url: 'https://base.gateway.tenderly.co',                       weight: 5,  maxConcurrent: 6  },
+
+  // Tier 3 — usable, lower limits or less reliable
+  { name: 'publicnode-alt', url: 'https://base.publicnode.com',                             weight: 5,  maxConcurrent: 6  },
+  { name: 'unifra',         url: 'https://base-mainnet.unifra.io',                         weight: 4,  maxConcurrent: 5  },
+  { name: 'stackup',        url: 'https://public.stackup.sh/api/v1/node/base-mainnet',    weight: 4,  maxConcurrent: 5  },
+  { name: 'chainnodes',     url: 'https://base-mainnet.chainnodes.org',                    weight: 4,  maxConcurrent: 5  },
+  { name: 'allnodes',       url: 'https://base-mainnet-rpc.allthatnode.com',               weight: 4,  maxConcurrent: 5  },
+  { name: 'tatum',          url: 'https://base-mainnet.gateway.tatum.io',                  weight: 3,  maxConcurrent: 4  },
 ];
 
 // Deduplicate by URL (keep highest weight)
@@ -49,8 +50,8 @@ const uniqueProviders = deduplicateProviders(providers);
 module.exports = {
   BASE_CHAIN_ID,
   providers: uniqueProviders,
-  addProvider(name, url, weight = 5) {
-    uniqueProviders.push({ name, url, weight });
+  addProvider(name, url, weight = 5, maxConcurrent = 6) {
+    uniqueProviders.push({ name, url, weight, maxConcurrent });
   },
   removeProvider(name) {
     const idx = uniqueProviders.findIndex(p => p.name === name);

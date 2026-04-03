@@ -1,22 +1,28 @@
 /**
- * Strategy: Fastest Healthy
- * Picks the healthy provider with the lowest recent latency.
+ * Strategy: Fastest Available
+ * Picks the available provider with the lowest smoothed latency.
+ * Respects exclude set so retries never go back to failed providers.
  */
 
-function select(providers, healthChecker) {
-  const healthy = healthChecker.getHealthy();
-  if (healthy.length === 0) return null;
+function select(providers, healthChecker, excludeSet = new Set()) {
+  const available = healthChecker.getAvailable();
+  if (available.length === 0) return null;
 
   let best = null;
-  let bestLatency = Infinity;
+  let bestScore = Infinity;
 
-  for (const p of healthy) {
+  for (const p of available) {
+    if (excludeSet.has(p.name)) continue;
+
     const s = healthChecker.getState(p.name);
-    const effectiveLatency = s.latency === Infinity ? 9999 : s.latency;
-    // Weight bias: lower latency * (1 / weight) favors higher-weight providers
-    const score = effectiveLatency / (p.weight || 1);
-    if (score < bestLatency) {
-      bestLatency = score;
+    // Use smoothed latency for stability, fall back to raw
+    const lat = s.smoothedLatency !== Infinity ? s.smoothedLatency : (s.latency !== Infinity ? s.latency : 9999);
+    // Weight bias + penalize high inflight count
+    const inflightPenalty = s.inflight * 50;
+    const score = (lat + inflightPenalty) / (p.weight || 1);
+
+    if (score < bestScore) {
+      bestScore = score;
       best = p;
     }
   }

@@ -1,17 +1,18 @@
 /**
  * Strategy: Weighted Round Robin
- * Cycles through healthy providers, weighted by their configured weight.
+ * Cycles through available providers, weighted by their configured weight.
+ * Respects exclude set.
  */
 
 let index = 0;
 
-function select(providers, healthChecker) {
-  const healthy = healthChecker.getHealthy();
-  if (healthy.length === 0) return null;
+function select(providers, healthChecker, excludeSet = new Set()) {
+  const available = healthChecker.getAvailable().filter(p => !excludeSet.has(p.name));
+  if (available.length === 0) return null;
 
   // Build weighted pool
   const pool = [];
-  for (const p of healthy) {
+  for (const p of available) {
     const count = Math.max(1, Math.ceil((p.weight || 5) / 2));
     for (let i = 0; i < count; i++) pool.push(p);
   }
