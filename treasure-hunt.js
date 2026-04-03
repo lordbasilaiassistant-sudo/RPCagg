@@ -333,9 +333,12 @@ class TreasureHunter {
           }
         }
 
-        // Check proxy
-        chunk[j].isProxy = hex.includes('363d3d373d3d3d363d73') || hex.includes('f4');
-        chunk[j].hasSelfdestruct = /ff(?=[0-9a-f]{0,4}$|[0-9a-f]{2}(?:00|5b))/.test(hex) || hex.includes('ff');
+        // Check proxy and selfdestruct via opcode-level disassembly.
+        // Naive string matching (includes('f4')) matches data bytes inside PUSH
+        // operands, producing ~71% false positive rate. Walk opcodes properly.
+        const opcodes = extractOpcodes(hex);
+        chunk[j].isProxy = hex.includes('363d3d373d3d3d363d73') || opcodes.has(0xf4); // DELEGATECALL
+        chunk[j].hasSelfdestruct = opcodes.has(0xff); // SELFDESTRUCT
 
         this.scanned++;
       }
@@ -566,6 +569,23 @@ function extractSelectors(hex) {
     selectors.add(match[1]);
   }
   return [...selectors];
+}
+
+// Walk bytecode at the opcode level, skipping PUSH data bytes.
+// Returns a Set of opcode values that appear as actual instructions (not data).
+function extractOpcodes(hex) {
+  const opcodes = new Set();
+  let i = 0;
+  while (i < hex.length) {
+    const op = parseInt(hex.substr(i, 2), 16);
+    opcodes.add(op);
+    // PUSHn opcodes (0x60-0x7f): skip the next n bytes of inline data
+    if (op >= 0x60 && op <= 0x7f) {
+      i += (op - 0x5f) * 2;
+    }
+    i += 2;
+  }
+  return opcodes;
 }
 
 function padAddress(addr) {

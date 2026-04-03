@@ -14,6 +14,22 @@ const IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d3
 const ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103';
 const BEACON_SLOT = '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50';
 
+// Walk bytecode at the opcode level, skipping PUSH data bytes.
+// Returns a Set of opcode values that appear as actual instructions (not data).
+function extractOpcodes(hex) {
+  const opcodes = new Set();
+  let i = 0;
+  while (i < hex.length) {
+    const op = parseInt(hex.substr(i, 2), 16);
+    opcodes.add(op);
+    if (op >= 0x60 && op <= 0x7f) {
+      i += (op - 0x5f) * 2; // skip PUSHn data
+    }
+    i += 2;
+  }
+  return opcodes;
+}
+
 // Common function selectors for classification
 const SELECTORS = {
   'facets()': '7a0ed627',              // Diamond (EIP-2535)
@@ -97,19 +113,24 @@ class ContractScanner extends BaseScanner {
       return info;
     }
 
+    // Walk bytecode at the opcode level to detect DELEGATECALL, CREATE,
+    // CREATE2, and SELFDESTRUCT. Naive string matching (includes('f4'))
+    // matches data bytes inside PUSH operands — ~71% false positive rate.
+    const opcodes = extractOpcodes(code);
+
     // Check for DELEGATECALL opcode (0xf4)
-    if (code.includes('f4')) {
+    if (opcodes.has(0xf4)) {
       info.isProxy = true;
       info.proxyType = 'delegatecall'; // will be refined below
     }
 
     // Check for CREATE/CREATE2 opcodes (factory detection)
-    if (code.includes('f0') || code.includes('f5')) {
+    if (opcodes.has(0xf0) || opcodes.has(0xf5)) {
       info.isFactory = true;
     }
 
     // SELFDESTRUCT detection (0xff)
-    if (code.includes('ff')) {
+    if (opcodes.has(0xff)) {
       info.hasSelfdestruct = true;
     }
 
