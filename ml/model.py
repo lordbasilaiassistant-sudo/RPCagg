@@ -13,7 +13,7 @@ Architecture:
   - Log-cosh loss for value regression (robust to outliers)
   - Combined anomaly score from reconstruction error + prediction disagreement
 
-Input: 35-dim feature vector from vectorizer.js
+Input: 38-dim feature vector from vectorizer.js (35 original + 3 transfer verification)
 Output: dict of per-task predictions + anomaly score
 
 Designed for real-time inference on every new contract (~0.1ms per forward pass).
@@ -164,31 +164,33 @@ class TreasureNet(nn.Module):
     Multi-task network for contract treasure detection.
 
     Architecture:
-        Input (35-dim) --> Feature Group Encoders (4 groups) --> Concat (128-dim)
-            --> Shared Encoder (3 residual blocks, 128-dim)
-                --> Autoencoder Decoder --> reconstruction (35-dim) [anomaly]
+        Input (38-dim) --> Feature Group Encoders (5 groups) --> Concat (160-dim)
+            --> Shared Encoder (3 residual blocks, 160-dim)
+                --> Autoencoder Decoder --> reconstruction (38-dim) [anomaly]
                 --> Value Head --> log(ETH + 1) prediction [regression]
                 --> Extraction Head --> P(extraction success) [binary]
                 --> Treasure Head --> P(treasure) [binary]
+                --> Transfer Head --> P(net positive ETH transfer) [binary]
 
     The autoencoder branch serves double duty:
         1. Anomaly score = reconstruction error (unusual contracts reconstruct poorly)
         2. Regularization (forces shared encoder to preserve all information)
 
-    Parameters: ~85K (fits in L1 cache, <0.1ms inference on CPU)
+    Parameters: ~110K (fits in L1 cache, <0.1ms inference on CPU)
     """
 
     # Feature group slicing indices (matching vectorizer.js)
-    STRUCTURAL = (0, 10)     # indices 0-9
-    FINANCIAL = (10, 17)     # indices 10-16
-    CAPABILITY = (17, 31)    # indices 17-30
-    EXTRACTION = (31, 35)    # indices 31-34
+    STRUCTURAL = (0, 10)       # indices 0-9
+    FINANCIAL = (10, 17)       # indices 10-16
+    CAPABILITY = (17, 31)      # indices 17-30
+    EXTRACTION = (31, 35)      # indices 31-34
+    TRANSFER_VERIF = (35, 38)  # indices 35-37 (gas pattern, revert check, caller balance)
 
-    GROUP_EMBED_DIM = 32     # Each group encodes to 32-dim
-    SHARED_DIM = 128         # 4 groups * 32 = 128
+    GROUP_EMBED_DIM = 32       # Each group encodes to 32-dim
+    SHARED_DIM = 160           # 5 groups * 32 = 160
     NUM_RESIDUAL = 3
 
-    def __init__(self, input_dim: int = 35, dropout: float = 0.15):
+    def __init__(self, input_dim: int = 38, dropout: float = 0.15):
         super().__init__()
         self.input_dim = input_dim
 
@@ -197,6 +199,7 @@ class TreasureNet(nn.Module):
         self.financial_enc = FeatureGroupEncoder(7, self.GROUP_EMBED_DIM, dropout)
         self.capability_enc = FeatureGroupEncoder(14, self.GROUP_EMBED_DIM, dropout)
         self.extraction_enc = FeatureGroupEncoder(4, self.GROUP_EMBED_DIM, dropout)
+        self.transfer_verif_enc = FeatureGroupEncoder(3, self.GROUP_EMBED_DIM, dropout)
 
         # --- Shared encoder (residual blocks) ---
         self.shared = nn.Sequential(
@@ -238,6 +241,14 @@ class TreasureNet(nn.Module):
             nn.Linear(32, 1),
         )
 
+        # Transfer verification: binary logit — predicts net positive ETH transfer to caller
+        self.transfer_head = nn.Sequential(
+            nn.Linear(self.SHARED_DIM, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -248,10 +259,11 @@ class TreasureNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # Bias the treasure/extraction heads toward negative (rare positive class).
+        # Bias the treasure/extraction/transfer heads toward negative (rare positive class).
         # log(0.01 / 0.99) ~ -4.6 means initial P(positive) ~ 1%
         nn.init.constant_(self.treasure_head[-1].bias, -4.6)
         nn.init.constant_(self.extraction_head[-1].bias, -4.6)
+        nn.init.constant_(self.transfer_head[-1].bias, -4.6)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode raw features into shared representation."""
@@ -259,7 +271,8 @@ class TreasureNet(nn.Module):
         f = self.financial_enc(x[:, self.FINANCIAL[0]:self.FINANCIAL[1]])
         c = self.capability_enc(x[:, self.CAPABILITY[0]:self.CAPABILITY[1]])
         e = self.extraction_enc(x[:, self.EXTRACTION[0]:self.EXTRACTION[1]])
-        fused = torch.cat([s, f, c, e], dim=-1)  # [B, 128]
+        t = self.transfer_verif_enc(x[:, self.TRANSFER_VERIF[0]:self.TRANSFER_VERIF[1]])
+        fused = torch.cat([s, f, c, e, t], dim=-1)  # [B, 160]
         return self.shared(fused)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -270,36 +283,43 @@ class TreasureNet(nn.Module):
         value_pred = self.value_head(z).squeeze(-1)
         extraction_logit = self.extraction_head(z).squeeze(-1)
         treasure_logit = self.treasure_head(z).squeeze(-1)
+        transfer_logit = self.transfer_head(z).squeeze(-1)
 
         return {
-            'z': z,                                         # Shared embedding [B, 128]
-            'reconstruction': reconstruction,               # Decoded features [B, 35]
+            'z': z,                                         # Shared embedding [B, 160]
+            'reconstruction': reconstruction,               # Decoded features [B, 38]
             'recon_error': recon_error,                     # Per-sample MSE [B]
             'value_pred': value_pred,                       # log(ETH+1) estimate [B]
             'extraction_logit': extraction_logit,           # Raw logit [B]
             'extraction_prob': torch.sigmoid(extraction_logit),
             'treasure_logit': treasure_logit,               # Raw logit [B]
             'treasure_prob': torch.sigmoid(treasure_logit),
-            'anomaly_score': self._compute_anomaly(recon_error, treasure_logit, extraction_logit),
+            'transfer_logit': transfer_logit,               # Raw logit [B]
+            'transfer_prob': torch.sigmoid(transfer_logit),
+            'anomaly_score': self._compute_anomaly(recon_error, treasure_logit, extraction_logit, transfer_logit),
         }
 
     def _compute_anomaly(self, recon_error: torch.Tensor,
                          treasure_logit: torch.Tensor,
-                         extraction_logit: torch.Tensor) -> torch.Tensor:
+                         extraction_logit: torch.Tensor,
+                         transfer_logit: torch.Tensor) -> torch.Tensor:
         """
         Combined anomaly score.
         High anomaly = unusual structure AND model thinks it might have value.
 
-        Score = recon_error * (1 + treasure_prob + extraction_prob)
+        Score = recon_error * (1 + treasure_prob + extraction_prob + transfer_prob)
 
         A boring empty contract may reconstruct poorly (high error) but has
-        low treasure/extraction probability, so the multiplier stays near 1.
+        low treasure/extraction/transfer probability, so the multiplier stays near 1.
         A contract that reconstructs poorly AND triggers the value detectors
-        gets amplified — that's what we want to flag.
+        gets amplified — that's what we want to flag. The transfer head adds
+        confidence that value actually moves to the caller, not just that
+        extraction functions exist.
         """
         t_prob = torch.sigmoid(treasure_logit)
         e_prob = torch.sigmoid(extraction_logit)
-        return recon_error * (1.0 + t_prob + e_prob)
+        xfer_prob = torch.sigmoid(transfer_logit)
+        return recon_error * (1.0 + t_prob + e_prob + xfer_prob)
 
 
 # ---------------------------------------------------------------------------
@@ -324,14 +344,24 @@ class ContractDataset(torch.utils.data.Dataset):
                 if not line:
                     continue
                 obj = json.loads(line)
-                features = torch.tensor(obj['features'], dtype=torch.float32)
+                raw_features = obj['features']
+                # Pad old 35-dim vectors to 38-dim (transfer verification features default to 0)
+                if len(raw_features) < 38:
+                    raw_features = raw_features + [0.0] * (38 - len(raw_features))
+                features = torch.tensor(raw_features[:38], dtype=torch.float32)
                 labels = obj.get('labels', {})
+                # transfer_verified: true only if treasure=true AND no false positive category
+                # (meaning extraction calls actually move value to the caller)
+                fp_cat = labels.get('falsePositiveCategory', None)
+                is_transfer = float(labels.get('treasure', False) and not fp_cat)
+
                 self.samples.append({
                     'features': features,
                     'has_value': float(labels.get('hasValue', False)),
                     'has_extraction': float(labels.get('hasCallableExtraction', False)),
                     'treasure': float(labels.get('treasure', False)),
                     'eth_value': float(labels.get('ethValue', 0.0)),
+                    'transfer_verified': is_transfer,
                 })
                 self.addresses.append(obj.get('address', ''))
 
@@ -345,9 +375,11 @@ class ContractDataset(torch.utils.data.Dataset):
         n_value = sum(1 for s in self.samples if s['has_value'] > 0.5)
         n_extract = sum(1 for s in self.samples if s['has_extraction'] > 0.5)
         n_treasure = sum(1 for s in self.samples if s['treasure'] > 0.5)
-        print(f"  has_value:     {n_value}/{n} ({100*n_value/n:.2f}%)")
-        print(f"  has_extraction:{n_extract}/{n} ({100*n_extract/n:.2f}%)")
-        print(f"  treasure:      {n_treasure}/{n} ({100*n_treasure/n:.2f}%)")
+        n_transfer = sum(1 for s in self.samples if s['transfer_verified'] > 0.5)
+        print(f"  has_value:         {n_value}/{n} ({100*n_value/n:.2f}%)")
+        print(f"  has_extraction:    {n_extract}/{n} ({100*n_extract/n:.2f}%)")
+        print(f"  treasure:          {n_treasure}/{n} ({100*n_treasure/n:.2f}%)")
+        print(f"  transfer_verified: {n_transfer}/{n} ({100*n_transfer/n:.2f}%)")
 
     def __len__(self):
         return len(self.samples)
@@ -370,31 +402,36 @@ class FeatureAugmentor:
                  existing positive samples
 
     All augmentations respect the [0, 1] bounds of the vectorizer output.
-    Binary features (indices 1, 2, 4, 5, 11, 16, 34) are never augmented.
+    Binary features (indices 1, 2, 4, 5, 11, 16, 34, 36) are never augmented.
     """
 
-    BINARY_INDICES = [1, 2, 4, 5, 11, 16, 34]
-    CONTINUOUS_INDICES = [i for i in range(35) if i not in [1, 2, 4, 5, 11, 16, 34]]
+    BINARY_INDICES = [1, 2, 4, 5, 11, 16, 34, 36]
+    DIM = 38
+    CONTINUOUS_INDICES = [i for i in range(38) if i not in {1, 2, 4, 5, 11, 16, 34, 36}]
 
     @staticmethod
     def add_noise(features: torch.Tensor, std: float = 0.02) -> torch.Tensor:
         """Add Gaussian noise to continuous features only."""
+        dim = features.shape[-1]
         noisy = features.clone()
         noise = torch.randn_like(features) * std
-        mask = torch.ones(35, dtype=torch.bool)
+        mask = torch.ones(dim, dtype=torch.bool)
         for idx in FeatureAugmentor.BINARY_INDICES:
-            mask[idx] = False
+            if idx < dim:
+                mask[idx] = False
         noisy[:, mask] = (features[:, mask] + noise[:, mask]).clamp(0, 1)
         return noisy
 
     @staticmethod
     def feature_dropout(features: torch.Tensor, p: float = 0.1) -> torch.Tensor:
         """Randomly zero out continuous features."""
+        dim = features.shape[-1]
         dropped = features.clone()
-        mask = torch.ones(35, dtype=torch.bool)
+        mask = torch.ones(dim, dtype=torch.bool)
         for idx in FeatureAugmentor.BINARY_INDICES:
-            mask[idx] = False
-        drop_mask = torch.rand(features.shape[0], 35) < p
+            if idx < dim:
+                mask[idx] = False
+        drop_mask = torch.rand(features.shape[0], dim) < p
         drop_mask[:, ~mask] = False
         dropped[drop_mask] = 0.0
         return dropped
@@ -406,6 +443,7 @@ class FeatureAugmentor:
         from k nearest neighbors and interpolate.
         """
         n = features.shape[0]
+        dim = features.shape[-1]
         if n < k + 1:
             k = max(1, n - 1)
 
@@ -423,7 +461,8 @@ class FeatureAugmentor:
 
         # Restore binary features from the original (don't interpolate them)
         for idx in FeatureAugmentor.BINARY_INDICES:
-            synthetic[:, idx] = features[:, idx]
+            if idx < dim:
+                synthetic[:, idx] = features[:, idx]
 
         return synthetic
 
@@ -496,14 +535,19 @@ class TreasureNetTrainer:
         self.recon_loss = nn.MSELoss()
         self.value_loss = LogCoshLoss()
         self.extraction_loss = AsymmetricLoss(gamma_pos=0.0, gamma_neg=4.0, clip=0.05)
-        self.treasure_loss = AsymmetricLoss(gamma_pos=0.0, gamma_neg=6.0, clip=0.02)
+        # clip raised from 0.02 to 0.05: prevents model from ignoring hard negatives
+        # at extreme gamma_neg=6.0. Without this, gradients for borderline negatives
+        # (p~0.3) are suppressed by ~1000x, causing blind spots on edge cases.
+        self.treasure_loss = AsymmetricLoss(gamma_pos=0.0, gamma_neg=6.0, clip=0.05)
+        self.transfer_loss = AsymmetricLoss(gamma_pos=0.0, gamma_neg=6.0, clip=0.05)
 
-        # Task loss weights — treasure gets 5x because it's the rarest and most important
+        # Task loss weights — treasure/transfer get 5x because rarest and most important
         self.loss_weights = {
             'recon': 1.0,
             'value': 2.0,
             'extraction': 3.0,
             'treasure': 5.0,
+            'transfer': 5.0,
         }
 
         self.optimizer = torch.optim.AdamW(
@@ -562,7 +606,8 @@ class TreasureNetTrainer:
                    f"recon={train_metrics['recon_loss']:.4f} "
                    f"value={train_metrics['value_loss']:.4f} "
                    f"extract={train_metrics['extract_loss']:.4f} "
-                   f"treasure={train_metrics['treasure_loss']:.4f} | "
+                   f"treasure={train_metrics['treasure_loss']:.4f} "
+                   f"transfer={train_metrics['transfer_loss']:.4f} | "
                    f"lr={lr:.2e}")
 
             if val_metrics:
@@ -574,9 +619,12 @@ class TreasureNetTrainer:
 
             # --- Early stopping on treasure recall ---
             current_recall = val_metrics.get('treasure_recall', train_metrics.get('treasure_recall', 0))
-            # We also factor in extraction recall — both matter
-            combined_recall = current_recall + 0.5 * val_metrics.get('extraction_recall',
-                                                                     train_metrics.get('extraction_recall', 0))
+            # We also factor in extraction and transfer recall — all matter
+            combined_recall = (current_recall +
+                              0.5 * val_metrics.get('extraction_recall',
+                                                     train_metrics.get('extraction_recall', 0)) +
+                              0.5 * val_metrics.get('transfer_recall',
+                                                     train_metrics.get('transfer_recall', 0)))
             if combined_recall > best_recall and epoch >= min_epochs // 2:
                 best_recall = combined_recall
                 best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
@@ -599,18 +647,21 @@ class TreasureNetTrainer:
     def _train_epoch(self, loader, epoch: int) -> Dict[str, float]:
         self.model.train()
         accum = {k: 0.0 for k in ['total_loss', 'recon_loss', 'value_loss',
-                                    'extract_loss', 'treasure_loss']}
+                                    'extract_loss', 'treasure_loss', 'transfer_loss']}
         n_batches = 0
         all_treasure_preds = []
         all_treasure_labels = []
         all_extract_preds = []
         all_extract_labels = []
+        all_transfer_preds = []
+        all_transfer_labels = []
 
         for batch in loader:
             features = batch['features'].to(self.device)
             has_extraction = batch['has_extraction'].to(self.device)
             treasure = batch['treasure'].to(self.device)
             eth_value = batch['eth_value'].to(self.device)
+            transfer_verified = batch['transfer_verified'].to(self.device)
 
             # Augmentation (stochastic per batch)
             if torch.rand(1).item() < 0.5:
@@ -629,11 +680,13 @@ class TreasureNetTrainer:
                 )
                 l_extract = self.extraction_loss(out['extraction_logit'], has_extraction)
                 l_treasure = self.treasure_loss(out['treasure_logit'], treasure)
+                l_transfer = self.transfer_loss(out['transfer_logit'], transfer_verified)
 
                 total = (self.loss_weights['recon'] * l_recon +
                          self.loss_weights['value'] * l_value +
                          self.loss_weights['extraction'] * l_extract +
-                         self.loss_weights['treasure'] * l_treasure)
+                         self.loss_weights['treasure'] * l_treasure +
+                         self.loss_weights['transfer'] * l_transfer)
 
             self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(total).backward()
@@ -647,13 +700,16 @@ class TreasureNetTrainer:
             accum['value_loss'] += l_value.item()
             accum['extract_loss'] += l_extract.item()
             accum['treasure_loss'] += l_treasure.item()
+            accum['transfer_loss'] += l_transfer.item()
             n_batches += 1
 
-            # Track predictions for recall computation
-            all_treasure_preds.append((out['treasure_prob'] > 0.3).cpu())
+            # Track predictions for recall computation — use production thresholds
+            all_treasure_preds.append((out['treasure_prob'] > TreasureDetector.TREASURE_THRESHOLD).cpu())
             all_treasure_labels.append(treasure.cpu())
-            all_extract_preds.append((out['extraction_prob'] > 0.3).cpu())
+            all_extract_preds.append((out['extraction_prob'] > TreasureDetector.EXTRACTION_THRESHOLD).cpu())
             all_extract_labels.append(has_extraction.cpu())
+            all_transfer_preds.append((out['transfer_prob'] > TreasureDetector.TRANSFER_THRESHOLD).cpu())
+            all_transfer_labels.append(transfer_verified.cpu())
 
         metrics = {k: v / max(n_batches, 1) for k, v in accum.items()}
 
@@ -662,6 +718,8 @@ class TreasureNetTrainer:
         all_tl = torch.cat(all_treasure_labels)
         all_ep = torch.cat(all_extract_preds)
         all_el = torch.cat(all_extract_labels)
+        all_xp = torch.cat(all_transfer_preds)
+        all_xl = torch.cat(all_transfer_labels)
 
         tp_treasure = ((all_tp == 1) & (all_tl == 1)).sum().float()
         fn_treasure = ((all_tp == 0) & (all_tl == 1)).sum().float()
@@ -671,24 +729,31 @@ class TreasureNetTrainer:
         fn_extract = ((all_ep == 0) & (all_el == 1)).sum().float()
         metrics['extraction_recall'] = (tp_extract / (tp_extract + fn_extract + 1e-8)).item()
 
+        tp_transfer = ((all_xp == 1) & (all_xl == 1)).sum().float()
+        fn_transfer = ((all_xp == 0) & (all_xl == 1)).sum().float()
+        metrics['transfer_recall'] = (tp_transfer / (tp_transfer + fn_transfer + 1e-8)).item()
+
         return metrics
 
     @torch.no_grad()
     def _validate(self, loader) -> Dict[str, float]:
         self.model.eval()
         accum = {k: 0.0 for k in ['total_loss', 'recon_loss', 'value_loss',
-                                    'extract_loss', 'treasure_loss']}
+                                    'extract_loss', 'treasure_loss', 'transfer_loss']}
         n_batches = 0
         all_treasure_preds = []
         all_treasure_labels = []
         all_extract_preds = []
         all_extract_labels = []
+        all_transfer_preds = []
+        all_transfer_labels = []
 
         for batch in loader:
             features = batch['features'].to(self.device)
             has_extraction = batch['has_extraction'].to(self.device)
             treasure = batch['treasure'].to(self.device)
             eth_value = batch['eth_value'].to(self.device)
+            transfer_verified = batch['transfer_verified'].to(self.device)
 
             out = self.model(features)
 
@@ -696,24 +761,29 @@ class TreasureNetTrainer:
             l_value = self.value_loss(out['value_pred'], torch.log1p(eth_value))
             l_extract = self.extraction_loss(out['extraction_logit'], has_extraction)
             l_treasure = self.treasure_loss(out['treasure_logit'], treasure)
+            l_transfer = self.transfer_loss(out['transfer_logit'], transfer_verified)
 
             total = (self.loss_weights['recon'] * l_recon +
                      self.loss_weights['value'] * l_value +
                      self.loss_weights['extraction'] * l_extract +
-                     self.loss_weights['treasure'] * l_treasure)
+                     self.loss_weights['treasure'] * l_treasure +
+                     self.loss_weights['transfer'] * l_transfer)
 
             accum['total_loss'] += total.item()
             accum['recon_loss'] += l_recon.item()
             accum['value_loss'] += l_value.item()
             accum['extract_loss'] += l_extract.item()
             accum['treasure_loss'] += l_treasure.item()
+            accum['transfer_loss'] += l_transfer.item()
             n_batches += 1
 
-            # Low threshold (0.3 instead of 0.5) to favor recall
-            all_treasure_preds.append((out['treasure_prob'] > 0.3).cpu())
+            # Use production thresholds for consistent metrics
+            all_treasure_preds.append((out['treasure_prob'] > TreasureDetector.TREASURE_THRESHOLD).cpu())
             all_treasure_labels.append(treasure.cpu())
-            all_extract_preds.append((out['extraction_prob'] > 0.3).cpu())
+            all_extract_preds.append((out['extraction_prob'] > TreasureDetector.EXTRACTION_THRESHOLD).cpu())
             all_extract_labels.append(has_extraction.cpu())
+            all_transfer_preds.append((out['transfer_prob'] > TreasureDetector.TRANSFER_THRESHOLD).cpu())
+            all_transfer_labels.append(transfer_verified.cpu())
 
         metrics = {k: v / max(n_batches, 1) for k, v in accum.items()}
 
@@ -721,6 +791,8 @@ class TreasureNetTrainer:
         all_tl = torch.cat(all_treasure_labels)
         all_ep = torch.cat(all_extract_preds)
         all_el = torch.cat(all_extract_labels)
+        all_xp = torch.cat(all_transfer_preds)
+        all_xl = torch.cat(all_transfer_labels)
 
         # Treasure metrics
         tp = ((all_tp == 1) & (all_tl == 1)).sum().float()
@@ -736,6 +808,13 @@ class TreasureNetTrainer:
         metrics['extraction_recall'] = (tp_e / (tp_e + fn_e + 1e-8)).item()
         metrics['extraction_precision'] = (tp_e / (tp_e + fp_e + 1e-8)).item()
 
+        # Transfer verification metrics
+        tp_x = ((all_xp == 1) & (all_xl == 1)).sum().float()
+        fp_x = ((all_xp == 1) & (all_xl == 0)).sum().float()
+        fn_x = ((all_xp == 0) & (all_xl == 1)).sum().float()
+        metrics['transfer_recall'] = (tp_x / (tp_x + fn_x + 1e-8)).item()
+        metrics['transfer_precision'] = (tp_x / (tp_x + fp_x + 1e-8)).item()
+
         return metrics
 
     @staticmethod
@@ -746,6 +825,7 @@ class TreasureNetTrainer:
             'has_extraction': torch.tensor([s['has_extraction'] for s in samples], dtype=torch.float32),
             'treasure': torch.tensor([s['treasure'] for s in samples], dtype=torch.float32),
             'eth_value': torch.tensor([s['eth_value'] for s in samples], dtype=torch.float32),
+            'transfer_verified': torch.tensor([s['transfer_verified'] for s in samples], dtype=torch.float32),
         }
 
 
@@ -759,8 +839,8 @@ class TreasureDetector:
 
     Usage:
         detector = TreasureDetector.load('treasurenet.pt')
-        result = detector.predict(feature_vector)  # 35-element list/array
-        results = detector.predict_batch(feature_matrix)  # Nx35
+        result = detector.predict(feature_vector)  # 38-element list/array
+        results = detector.predict_batch(feature_matrix)  # Nx38
 
     Decision thresholds are intentionally low to minimize false negatives.
     The cost of missing a treasure far exceeds the cost of investigating a
@@ -770,6 +850,7 @@ class TreasureDetector:
     # Thresholds tuned for high recall
     TREASURE_THRESHOLD = 0.20     # Flag if >= 20% chance of treasure
     EXTRACTION_THRESHOLD = 0.25   # Flag if >= 25% chance of extraction
+    TRANSFER_THRESHOLD = 0.25     # Flag if >= 25% chance of net positive transfer
     ANOMALY_PERCENTILE = 95       # Flag top 5% anomaly scores
 
     def __init__(self, model: TreasureNet, device: str = 'cpu'):
@@ -796,7 +877,7 @@ class TreasureDetector:
     @torch.no_grad()
     def predict(self, features) -> Dict:
         """
-        Predict on a single 35-dim feature vector.
+        Predict on a single 38-dim feature vector.
 
         Returns dict with all predictions + boolean flags for each alert type.
         """
@@ -811,6 +892,7 @@ class TreasureDetector:
         anomaly = out['anomaly_score'].item()
         treasure_p = out['treasure_prob'].item()
         extract_p = out['extraction_prob'].item()
+        transfer_p = out['transfer_prob'].item()
         value_pred = out['value_pred'].item()
 
         # Update running anomaly stats
@@ -824,13 +906,18 @@ class TreasureDetector:
         # Compute flags
         is_treasure = treasure_p >= self.TREASURE_THRESHOLD
         is_extractable = extract_p >= self.EXTRACTION_THRESHOLD
+        is_transfer = transfer_p >= self.TRANSFER_THRESHOLD
         is_anomaly = anomaly >= self._anomaly_threshold
         eth_estimate = np.expm1(value_pred)  # Reverse log1p
 
         # Priority scoring: weighted combination for triage
+        # Transfer verification acts as a confidence multiplier — high transfer_prob
+        # means the model believes value actually moves to caller, not just that
+        # extraction functions exist
         priority = (
             3.0 * treasure_p +
             2.0 * extract_p +
+            2.0 * transfer_p +
             1.0 * min(anomaly / (self._anomaly_threshold + 1e-8), 2.0) +
             0.5 * min(eth_estimate, 10.0) / 10.0
         )
@@ -838,14 +925,16 @@ class TreasureDetector:
         return {
             'treasure_prob': round(treasure_p, 4),
             'extraction_prob': round(extract_p, 4),
+            'transfer_prob': round(transfer_p, 4),
             'eth_estimate': round(eth_estimate, 6),
             'anomaly_score': round(anomaly, 6),
             'anomaly_threshold': round(self._anomaly_threshold, 6),
             'is_treasure': is_treasure,
             'is_extractable': is_extractable,
+            'is_transfer': is_transfer,
             'is_anomaly': is_anomaly,
             'priority': round(priority, 4),
-            'alert': is_treasure or is_extractable or is_anomaly,
+            'alert': is_treasure or (is_extractable and is_transfer) or is_anomaly,
         }
 
     @torch.no_grad()
@@ -861,22 +950,28 @@ class TreasureDetector:
             anomaly = out['anomaly_score'][i].item()
             treasure_p = out['treasure_prob'][i].item()
             extract_p = out['extraction_prob'][i].item()
+            transfer_p = out['transfer_prob'][i].item()
             value_pred = out['value_pred'][i].item()
 
             self._anomaly_scores.append(anomaly)
             eth_estimate = np.expm1(value_pred)
 
+            is_treasure = treasure_p >= self.TREASURE_THRESHOLD
+            is_extractable = extract_p >= self.EXTRACTION_THRESHOLD
+            is_transfer = transfer_p >= self.TRANSFER_THRESHOLD
+
             results.append({
                 'treasure_prob': round(treasure_p, 4),
                 'extraction_prob': round(extract_p, 4),
+                'transfer_prob': round(transfer_p, 4),
                 'eth_estimate': round(eth_estimate, 6),
                 'anomaly_score': round(anomaly, 6),
-                'is_treasure': treasure_p >= self.TREASURE_THRESHOLD,
-                'is_extractable': extract_p >= self.EXTRACTION_THRESHOLD,
-                'alert': (treasure_p >= self.TREASURE_THRESHOLD or
-                          extract_p >= self.EXTRACTION_THRESHOLD),
+                'is_treasure': is_treasure,
+                'is_extractable': is_extractable,
+                'is_transfer': is_transfer,
+                'alert': is_treasure or (is_extractable and is_transfer),
                 'priority': round(
-                    3.0 * treasure_p + 2.0 * extract_p +
+                    3.0 * treasure_p + 2.0 * extract_p + 2.0 * transfer_p +
                     0.5 * min(eth_estimate, 10.0) / 10.0, 4),
             })
 
@@ -934,11 +1029,12 @@ class _TraceableForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
                                                   torch.Tensor, torch.Tensor,
-                                                  torch.Tensor]:
+                                                  torch.Tensor, torch.Tensor]:
         out = self.model(x)
-        # Returns: (anomaly_score, treasure_prob, extraction_prob, value_pred, recon_error)
+        # Returns: (anomaly_score, treasure_prob, extraction_prob, transfer_prob, value_pred, recon_error)
         return (out['anomaly_score'], out['treasure_prob'],
-                out['extraction_prob'], out['value_pred'], out['recon_error'])
+                out['extraction_prob'], out['transfer_prob'],
+                out['value_pred'], out['recon_error'])
 
 
 def export_for_inference(model: TreasureNet, path: str):
@@ -948,7 +1044,7 @@ def export_for_inference(model: TreasureNet, path: str):
     model.eval()
     wrapper = _TraceableForward(model)
     wrapper.eval()
-    dummy = torch.randn(1, 35)
+    dummy = torch.randn(1, 38)
     traced = torch.jit.trace(wrapper, dummy)
     traced_path = path.replace('.pt', '_traced.pt')
     traced.save(traced_path)
@@ -1057,6 +1153,7 @@ def main():
             print(f"  {a['address']} | "
                   f"treasure={a['treasure_prob']:.3f} "
                   f"extract={a['extraction_prob']:.3f} "
+                  f"transfer={a['transfer_prob']:.3f} "
                   f"eth~={a['eth_estimate']:.4f} "
                   f"priority={a['priority']:.2f}"
                   f"{'  *** TREASURE ***' if a['is_treasure'] else ''}")

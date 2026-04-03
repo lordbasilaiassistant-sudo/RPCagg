@@ -87,6 +87,14 @@ class Vectorizer {
     features.push(normalize(simSuccess, 0, 50));                         // 33: successful sims count
     features.push(contract.treasure ? 1 : 0);                           // 34: labeled as treasure
 
+    // --- Transfer verification features (indices 35-37) ---
+    // These help the model detect whether extraction calls actually move value.
+    const gasEstimates = contract.gasEstimates || [];
+    const flatGasCount = gasEstimates.filter(g => g <= 26000).length;
+    features.push(gasEstimates.length > 0 ? flatGasCount / gasEstimates.length : 0); // 35: fraction of calls with flat gas (~21K = view fn)
+    features.push(contract.withdrawRevertsForCaller ? 1 : 0);           // 36: withdraw/exit reverts for our address
+    features.push(logNormalize(contract.callerBalanceInContract || 0));  // 37: our balanceOf() in the contract (log-normalized)
+
     // Labels (for supervised training)
     const labels = {
       hasValue: ethBal > 0 || Object.keys(tokenBals).length > 0,
@@ -150,10 +158,13 @@ function normalize(val, min, max) {
   return Math.max(0, Math.min(1, (val - min) / (max - min)));
 }
 
-// Log normalize for financial values (handles extreme range)
+// Log normalize for financial values (handles extreme range).
+// Divisor=6 maps the practical range [0, 1M] to [0, 1] with good separation
+// in the critical 1-1000 ETH band. Previous divisor=10 wasted half the output
+// range on values that don't exist (>10B), compressing all real values into [0, 0.54].
 function logNormalize(val) {
   if (val <= 0) return 0;
-  return Math.min(1, Math.log10(val + 1) / 10); // log10(1B+1)/10 ≈ 0.9
+  return Math.min(1, Math.log10(val + 1) / 6);
 }
 
 // Encode proxy type as a float

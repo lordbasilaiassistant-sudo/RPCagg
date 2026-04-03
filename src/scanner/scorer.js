@@ -57,14 +57,18 @@ class Scorer {
       vulnerability: this._vulnerabilityScore(contract),
     };
 
-    // Weighted geometric mean (multiplicative — all dimensions must contribute)
+    // Weighted power mean (p=0.5) — less punitive than geometric mean when
+    // some dimensions are zero. Geometric mean kills the score if ANY dimension
+    // is zero; power mean with p<1 degrades gracefully.
+    // Math: M_p = (sum(w_i * x_i^p) / sum(w_i))^(1/p)
+    const p = 0.5;
     let weightedSum = 0;
     let totalWeight = 0;
     for (const [dim, weight] of Object.entries(WEIGHTS)) {
-      weightedSum += Math.log(scores[dim] + 0.001) * weight;
+      weightedSum += Math.pow(Math.max(scores[dim], 0), p) * weight;
       totalWeight += weight;
     }
-    const combined = Math.exp(weightedSum / totalWeight);
+    const combined = Math.pow(weightedSum / totalWeight, 1 / p);
 
     const result = {
       address: contract.address,
@@ -145,13 +149,16 @@ class Scorer {
   _ageScore(c) {
     if (!c.blockNumber) return 0;
     // Older = higher score (more likely forgotten)
-    // Base head is ~44M, early blocks are <5M
-    const age = 44000000 - c.blockNumber;
-    if (age > 40000000) return 1.0;  // genesis era
-    if (age > 30000000) return 0.8;  // first year
-    if (age > 20000000) return 0.5;  // 2024
-    if (age > 10000000) return 0.3;  // recent
-    return 0.1;
+    // Use current head estimate: ~2 blocks/sec * 86400 * 365 ≈ 63M blocks/year
+    // Base launched mid-2023, so head ≈ blockNumber of most recent scan.
+    // We normalize relative to max observed block rather than hardcoding.
+    const HEAD_ESTIMATE = c._headBlock || 50000000; // pass in or fallback
+    const age = HEAD_ESTIMATE - c.blockNumber;
+    const maxAge = HEAD_ESTIMATE; // age relative to chain start
+    if (maxAge <= 0) return 0;
+    // Sigmoid-like curve: rapid rise for older contracts, plateau near 1.0
+    // age/maxAge in [0,1], mapped through x^0.3 for diminishing returns
+    return Math.min(1.0, Math.pow(Math.max(0, age / maxAge), 0.3));
   }
 
   _vulnerabilityScore(c) {
