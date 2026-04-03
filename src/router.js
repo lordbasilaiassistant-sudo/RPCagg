@@ -89,10 +89,11 @@ class Router {
     }
 
     this.stats.errors++;
+    log.warn(`all retries exhausted`, { method: rpcBody.method, reason: retryReason });
     return {
       jsonrpc: '2.0',
       id: rpcBody.id || null,
-      error: { code: -32603, message: `All retries exhausted: ${retryReason}` },
+      error: { code: -32603, message: 'Request failed after all retries' },
     };
   }
 

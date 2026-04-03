@@ -35,8 +35,9 @@ const app = createServer(router, healthChecker);
 
 healthChecker.start();
 
-const server = app.listen(PORT, () => {
-  log.info(`listening on http://localhost:${PORT}`);
+const HOST = process.env.HOST || '127.0.0.1';
+const server = app.listen(PORT, HOST, () => {
+  log.info(`listening on http://${HOST}:${PORT}`);
   log.info(`point ethers/viem/curl at http://localhost:${PORT}`);
   log.info(`status: http://localhost:${PORT}/health`);
   log.info(`stats:  http://localhost:${PORT}/stats`);
