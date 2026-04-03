@@ -232,18 +232,12 @@ function encodeProxyType(type) {
   return types[type] || 0;
 }
 
-// Encode worst exploit severity as a float
-function encodeExploitSeverity(severity) {
-  return SEVERITY_ENCODING[severity] || 0;
-}
-
 // Classify ownership status for enriched labels
 function classifyOwnership(owner, deployer, contract) {
   if (!owner || owner === '0x' + '0'.repeat(40)) return 'renounced';
   if (DEAD_ADDRESSES.has(owner)) return 'burned';
   if (owner && deployer && owner === deployer) return 'deployer_owned';
-  if (contract.ownerIsEOA) return 'eoa_owned';
-  return 'contract_owned';
+  return 'other';
 }
 
 module.exports = { Vectorizer, SELECTOR_CATEGORIES, DEAD_ADDRESSES };

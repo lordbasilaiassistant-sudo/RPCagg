@@ -97,6 +97,8 @@ function decodeMulticall3Result(result, count) {
 }
 
 // --- Phase 1: Batch ETH Balance Check ---
+// Uses JSON-RPC batch eth_getBalance through the aggregator's batch support.
+// RpcClient.batchChunked handles chunking and error handling.
 
 async function batchCheckBalances(rpc, addresses) {
   const balances = new Map();
@@ -105,60 +107,54 @@ async function batchCheckBalances(rpc, addresses) {
   let funded = 0;
 
   console.log(`\n[Phase 1] Checking ETH balances for ${total.toLocaleString()} contracts...`);
-  console.log(`  Batch size: ${BALANCE_BATCH_SIZE} per Multicall3 call`);
+  console.log(`  Batch size: ${BALANCE_BATCH_SIZE} via JSON-RPC batch`);
   console.log(`  Min balance: ${MIN_ETH_BALANCE} ETH\n`);
 
   for (let i = 0; i < addresses.length; i += BALANCE_BATCH_SIZE) {
     const batch = addresses.slice(i, i + BALANCE_BATCH_SIZE);
 
-    // Use Multicall3.getEthBalance(address) for each contract
-    const mc3Calls = batch.map(addr => ({
-      target: MULTICALL3,
-      allowFailure: true,
-      callData: '0x' + GET_ETH_BALANCE_SEL + addr.replace('0x', '').toLowerCase().padStart(64, '0'),
+    const calls = batch.map(addr => ({
+      method: 'eth_getBalance',
+      params: [addr, 'latest'],
     }));
 
     try {
-      const encoded = encodeMulticall3(mc3Calls);
-      const raw = await rpc.call('eth_call', [{ to: MULTICALL3, data: encoded }, 'latest']);
-      const decoded = decodeMulticall3Result(raw, mc3Calls.length);
+      const results = await rpc.batchChunked(calls, 50);
 
-      for (let j = 0; j < decoded.length; j++) {
-        if (decoded[j].success && decoded[j].data && decoded[j].data.length >= 66) {
-          const wei = BigInt(decoded[j].data);
-          const eth = Number(wei) / 1e18;
-          if (eth >= MIN_ETH_BALANCE) {
-            balances.set(batch[j].toLowerCase(), { wei: wei.toString(), eth });
-            funded++;
-          }
+      for (let j = 0; j < results.length; j++) {
+        const r = results[j];
+        if (r && typeof r === 'string' && r !== '0x0') {
+          try {
+            const wei = BigInt(r);
+            const eth = Number(wei) / 1e18;
+            if (eth >= MIN_ETH_BALANCE) {
+              balances.set(batch[j].toLowerCase(), { wei: wei.toString(), eth });
+              funded++;
+            }
+          } catch { /* skip malformed */ }
+        } else if (r && r.result && typeof r.result === 'string') {
+          try {
+            const wei = BigInt(r.result);
+            const eth = Number(wei) / 1e18;
+            if (eth >= MIN_ETH_BALANCE) {
+              balances.set(batch[j].toLowerCase(), { wei: wei.toString(), eth });
+              funded++;
+            }
+          } catch { /* skip */ }
         }
       }
     } catch (err) {
-      // Fallback: smaller batches of 50
-      for (let k = 0; k < batch.length; k += 50) {
-        const smallBatch = batch.slice(k, k + 50);
+      console.error(`  WARNING: batch at offset ${i} failed: ${err.message}, trying individually...`);
+      for (const addr of batch) {
         try {
-          const mc3Small = smallBatch.map(addr => ({
-            target: MULTICALL3,
-            allowFailure: true,
-            callData: '0x' + GET_ETH_BALANCE_SEL + addr.replace('0x', '').toLowerCase().padStart(64, '0'),
-          }));
-          const enc = encodeMulticall3(mc3Small);
-          const raw2 = await rpc.call('eth_call', [{ to: MULTICALL3, data: enc }, 'latest']);
-          const dec2 = decodeMulticall3Result(raw2, mc3Small.length);
-          for (let m = 0; m < dec2.length; m++) {
-            if (dec2[m].success && dec2[m].data && dec2[m].data.length >= 66) {
-              const wei = BigInt(dec2[m].data);
-              const eth = Number(wei) / 1e18;
-              if (eth >= MIN_ETH_BALANCE) {
-                balances.set(smallBatch[m].toLowerCase(), { wei: wei.toString(), eth });
-                funded++;
-              }
-            }
+          const r = await rpc.call('eth_getBalance', [addr, 'latest']);
+          const wei = BigInt(r);
+          const eth = Number(wei) / 1e18;
+          if (eth >= MIN_ETH_BALANCE) {
+            balances.set(addr.toLowerCase(), { wei: wei.toString(), eth });
+            funded++;
           }
-        } catch (e2) {
-          console.error(`  WARNING: batch at offset ${i + k} failed: ${e2.message}`);
-        }
+        } catch { /* skip */ }
       }
     }
 

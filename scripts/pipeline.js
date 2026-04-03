@@ -27,8 +27,89 @@ setLevel(process.env.LOG_LEVEL || 'info');
 const RPC = process.env.RPC_URL || 'http://127.0.0.1:8545';
 const DATA = path.join(__dirname, '..', 'data');
 const EXECUTE = process.argv.includes('--execute');
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const OUR_WALLET = process.env.EXECUTOR_WALLET || '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
+
+// EIP-1967 storage slots
+const IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+const ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103';
+const BEACON_SLOT = '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50';
+const ZERO_ADDR = '0x' + '0'.repeat(40);
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
+
+// ─── Multicall3 helpers ─────────────────────────────
+// getEthBalance(address) selector = 0x4d2301cc
+function encodeGetEthBalance(addr) {
+  return '0x4d2301cc' + addr.toLowerCase().replace('0x', '').padStart(64, '0');
+}
+
+// eth_getStorageAt(address, slot) encoded as staticcall via Multicall3
+function encodeStorageRead(addr, slot) {
+  // We can't call eth_getStorageAt through Multicall3 directly, but we CAN
+  // read storage via Multicall3 by using aggregate3 with target=addr and
+  // callData for a known storage getter. For arbitrary slots, we batch via
+  // JSON-RPC instead. This helper is for the JSON-RPC batch path.
+  return { method: 'eth_getStorageAt', params: [addr, slot, 'latest'] };
+}
+
+function encodeMulticall3(calls) {
+  const selector = '82ad56cb';
+  let encoded = selector;
+  encoded += '0000000000000000000000000000000000000000000000000000000000000020';
+  encoded += BigInt(calls.length).toString(16).padStart(64, '0');
+  const elemOffsets = [];
+  let currentOffset = calls.length * 32;
+  for (const call of calls) {
+    elemOffsets.push(currentOffset);
+    const dataLen = (call.callData.replace('0x', '').length / 2);
+    const paddedLen = Math.ceil(dataLen / 32) * 32;
+    currentOffset += 32 + 32 + 32 + 32 + paddedLen;
+  }
+  for (const offset of elemOffsets) {
+    encoded += BigInt(offset).toString(16).padStart(64, '0');
+  }
+  for (const call of calls) {
+    encoded += call.target.toLowerCase().replace('0x', '').padStart(64, '0');
+    encoded += call.allowFailure ? '0000000000000000000000000000000000000000000000000000000000000001' : '0000000000000000000000000000000000000000000000000000000000000000';
+    encoded += '0000000000000000000000000000000000000000000000000000000000000060';
+    const data = call.callData.replace('0x', '');
+    const dataLen = data.length / 2;
+    encoded += BigInt(dataLen).toString(16).padStart(64, '0');
+    const paddedLen = Math.ceil(dataLen / 32) * 32;
+    encoded += data.padEnd(paddedLen * 2, '0');
+  }
+  return '0x' + encoded;
+}
+
+function decodeMulticall3Result(result, count) {
+  const hex = result.replace('0x', '');
+  const decoded = [];
+  let pos = 128;
+  const offsets = [];
+  for (let i = 0; i < count; i++) {
+    offsets.push(parseInt(hex.substring(pos, pos + 64), 16) * 2);
+    pos += 64;
+  }
+  for (let i = 0; i < count; i++) {
+    const base = 64 + offsets[i];
+    const success = parseInt(hex.substring(base, base + 64), 16) === 1;
+    const dataOffset = parseInt(hex.substring(base + 64, base + 128), 16) * 2;
+    const dataStart = base + dataOffset;
+    const dataLen = parseInt(hex.substring(dataStart, dataStart + 64), 16);
+    const data = '0x' + hex.substring(dataStart + 64, dataStart + 64 + dataLen * 2);
+    decoded.push({ success, data });
+  }
+  return decoded;
+}
+
+function slotToAddress(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const hex = raw.replace('0x', '').padStart(64, '0');
+  const addr = '0x' + hex.slice(-40);
+  if (addr === ZERO_ADDR) return null;
+  return addr;
+}
 
 async function phase1_discover(rpc, startBlock, endBlock) {
   log.info(`PHASE 1: Event discovery — blocks ${startBlock} to ${endBlock}`);
@@ -44,36 +125,61 @@ async function phase1_discover(rpc, startBlock, endBlock) {
 }
 
 async function phase2_balance(rpc, addresses) {
-  log.info(`PHASE 2: Balance check — ${addresses.length} contracts`);
+  log.info(`PHASE 2: Multicall3 balance check — ${addresses.length} contracts`);
   const funded = [];
-  const BATCH = 150;
+  const MC3_BATCH = 200; // 200 getEthBalance calls per Multicall3 aggregate3()
 
-  for (let i = 0; i < addresses.length; i += BATCH) {
-    const chunk = addresses.slice(i, i + BATCH);
-    const calls = chunk.map(addr => ({ method: 'eth_getBalance', params: [addr, 'latest'] }));
+  for (let i = 0; i < addresses.length; i += MC3_BATCH) {
+    const chunk = addresses.slice(i, i + MC3_BATCH);
+
+    // Build Multicall3 aggregate3 call with getEthBalance for each address
+    const mc3Calls = chunk.map(addr => ({
+      target: MULTICALL3,
+      allowFailure: true,
+      callData: encodeGetEthBalance(addr),
+    }));
 
     try {
-      const results = await rpc.batch(calls);
-      for (let j = 0; j < chunk.length; j++) {
-        const bal = results[j];
-        if (bal && !bal.error && typeof bal === 'string') {
-          const wei = BigInt(bal);
+      const encoded = encodeMulticall3(mc3Calls);
+      const result = await rpc.call('eth_call', [{ to: MULTICALL3, data: encoded }, 'latest']);
+      const decoded = decodeMulticall3Result(result, chunk.length);
+
+      for (let j = 0; j < decoded.length; j++) {
+        if (decoded[j].success && decoded[j].data !== '0x' + '0'.repeat(64)) {
+          const wei = BigInt(decoded[j].data);
           if (wei > 1000000000000000n) { // > 0.001 ETH
             funded.push({ address: chunk[j], ethBalance: wei, ethFormatted: (Number(wei) / 1e18).toFixed(6) });
           }
         }
       }
     } catch (err) {
-      log.warn(`  batch failed at ${i}: ${err.message}`);
+      // Fallback to JSON-RPC batch if Multicall3 fails
+      log.warn(`  mc3 batch failed at ${i}, falling back to RPC batch: ${err.message}`);
+      const calls = chunk.map(addr => ({ method: 'eth_getBalance', params: [addr, 'latest'] }));
+      try {
+        const results = await rpc.batch(calls);
+        for (let j = 0; j < chunk.length; j++) {
+          const bal = results[j];
+          if (bal && !bal.error && typeof bal === 'string') {
+            const wei = BigInt(bal);
+            if (wei > 1000000000000000n) {
+              funded.push({ address: chunk[j], ethBalance: wei, ethFormatted: (Number(wei) / 1e18).toFixed(6) });
+            }
+          }
+        }
+      } catch (err2) {
+        log.warn(`  RPC batch also failed at ${i}: ${err2.message}`);
+      }
     }
 
-    if (i % 3000 === 0 && i > 0) {
-      log.info(`  checked ${i}/${addresses.length} | funded: ${funded.length}`);
+    if (i % 2000 === 0 && i > 0) {
+      log.info(`  checked ${i}/${addresses.length} | funded: ${funded.length} | ${Math.ceil(i / MC3_BATCH)} mc3 calls`);
     }
   }
 
   funded.sort((a, b) => Number(b.ethBalance - a.ethBalance));
-  log.info(`  funded: ${funded.length} contracts with > 0.001 ETH`);
+  const mc3Calls = Math.ceil(addresses.length / MC3_BATCH);
+  log.info(`  funded: ${funded.length} contracts with > 0.001 ETH (${mc3Calls} Multicall3 calls vs ${addresses.length} individual calls)`);
   return funded;
 }
 

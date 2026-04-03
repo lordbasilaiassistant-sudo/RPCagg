@@ -169,11 +169,16 @@ class Labeler {
     // to take ownership, but the treasure label is misleading
     const selectors = (treasure.selectors || vectorData?.selectors || []);
     const hasCallableInit = selectors.some(s => INITIALIZER_SELECTORS.has(s));
-    const exploits = treasure.exploitResults || vectorData?.exploitResults || {};
-    const isReinitable = exploits.reinitializable || hasCallableInit;
+    // Support both old exploitResults object and new exploitPatterns array format
+    const exploitPatterns = treasure.exploitPatterns || vectorData?.exploitPatterns || [];
+    const exploitMap = new Map(exploitPatterns.map(r => [r.pattern, r]));
+    const reinitResult = exploitMap.get('reinitialization');
+    const isReinitable = (reinitResult && reinitResult.detected) || hasCallableInit;
 
     // Check 5: Metamorphic — CREATE2 + SELFDESTRUCT, code can be replaced
-    const isMetamorphic = exploits.hasCreate2 && (treasure.hasSelfdestruct || vectorData?.hasSelfdestruct);
+    const metamorphicResult = exploitMap.get('metamorphic_create2');
+    const isMetamorphic = (metamorphicResult && metamorphicResult.detected) ||
+      (treasure.hasSelfdestruct || vectorData?.hasSelfdestruct);
 
     // Check 6: Staking contract with no position
     const hasStakingOnly = actions.some(a => STAKING_SELECTORS.has(a.selector));
