@@ -187,14 +187,15 @@ class TreasureHunter {
 
   async resolveAddresses(deployments) {
     const contracts = [];
-    const BATCH = 50;       // receipts per batch
-    const CONCURRENCY = 5;  // parallel batches
+    const BATCH = 25;       // receipts per batch (smaller to avoid overwhelming RPCs)
+    const CONCURRENCY = 2;  // parallel batches (gentler on rate-limited providers)
 
     const chunks = [];
     for (let i = 0; i < deployments.length; i += BATCH) {
       chunks.push(deployments.slice(i, i + BATCH));
     }
 
+    let batchErrors = 0;
     for (let ci = 0; ci < chunks.length; ci += CONCURRENCY) {
       const wave = chunks.slice(ci, ci + CONCURRENCY);
 
@@ -203,7 +204,13 @@ class TreasureHunter {
           method: 'eth_getTransactionReceipt',
           params: [d.txHash],
         }));
-        return { chunk, receipts: await this.rpc.batch(calls) };
+        try {
+          return { chunk, receipts: await this.rpc.batch(calls) };
+        } catch (err) {
+          batchErrors++;
+          log.warn(`receipt batch failed: ${err.message}`);
+          return { chunk, receipts: chunk.map(() => null) };
+        }
       }));
 
       for (const { chunk, receipts } of waveResults) {
@@ -219,8 +226,8 @@ class TreasureHunter {
         }
       }
 
-      if (ci % 5 === 0 && ci > 0) {
-        log.info(`  resolved ${contracts.length}/${deployments.length} addresses`);
+      if ((ci > 0 && ci % 4 === 0) || ci === chunks.length - CONCURRENCY) {
+        log.info(`  resolved ${contracts.length}/${deployments.length} addresses (${batchErrors} batch errors)`);
       }
     }
 

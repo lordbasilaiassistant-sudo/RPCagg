@@ -23,6 +23,7 @@ const WEIGHTS = {
   anomaly: 1.5,
   age: 1.0,
   vulnerability: 2.0,
+  mev: 2.5,  // MEV competition adjustment — boost obscure targets, penalize obvious ones
 };
 
 // Known high-value extraction selectors (ordered by extraction likelihood)
@@ -55,6 +56,7 @@ class Scorer {
       anomaly: this._anomalyScore(contract),
       age: this._ageScore(contract),
       vulnerability: this._vulnerabilityScore(contract),
+      mev: this._mevScore(contract),
     };
 
     // Weighted power mean (p=0.5) — less punitive than geometric mean when

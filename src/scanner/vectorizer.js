@@ -104,11 +104,18 @@ class Vectorizer {
       proxyType: contract.proxyType || 'none',
     };
 
+    // Raw selector hashes for learned embedding (bag-of-selectors input).
+    // Each 4-byte selector is converted to an integer for the embedding lookup.
+    // This replaces the hardcoded category buckets for the neural net —
+    // the model learns which selector combinations predict value.
+    const selectorHashes = (contract.selectors || []).map(s => parseInt(s, 16));
+
     const vector = {
       address: contract.address,
       deployer: contract.deployer,
       block: contract.blockNumber,
       features,
+      selectorHashes,
       labels,
       dim: features.length,
     };

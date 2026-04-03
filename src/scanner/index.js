@@ -12,6 +12,8 @@ const { EntropyScorer } = require('./entropy-scorer');
 const { BlockPrioritizer } = require('./block-prioritizer');
 const { analyzeExploitPatterns, quickBytecodeFlags } = require('./exploit-patterns');
 const { TokenDiscovery, KNOWN_TOKENS } = require('./token-discovery');
+const { DexPricer, FACTORIES: DEX_FACTORIES, WETH, STABLES } = require('./dex-pricer');
+const { BytecodeSimilarity, extractOpcodes, computeNgrams, jaccardSimilarity } = require('./bytecode-similarity');
 
 module.exports = {
   RpcClient,
@@ -24,10 +26,18 @@ module.exports = {
   EntropyScorer,
   BlockPrioritizer,
   TokenDiscovery,
+  DexPricer,
+  BytecodeSimilarity,
   KNOWN_TOKENS,
+  DEX_FACTORIES,
+  WETH,
+  STABLES,
   IMPL_SLOT,
   ADMIN_SLOT,
   BEACON_SLOT,
   analyzeExploitPatterns,
   quickBytecodeFlags,
+  extractOpcodes,
+  computeNgrams,
+  jaccardSimilarity,
 };

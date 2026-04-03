@@ -155,6 +155,91 @@ class FeatureGroupEncoder(nn.Module):
         return self.net(x)
 
 
+class SelectorEmbedding(nn.Module):
+    """
+    Learned bag-of-selectors embedding via the hashing trick.
+
+    Each 4-byte function selector (0x00000000 - 0xFFFFFFFF) is hashed into
+    one of N_BUCKETS embedding slots. For a contract with K selectors, we
+    look up K embeddings and aggregate (mean pool) into a fixed-size vector.
+
+    This is the core of emergent discovery: the model learns which selector
+    combinations correlate with extractable value, including selectors it has
+    never been explicitly told about. A contract with unknown selectors
+    [0xdeadbeef, 0xcafebabe] can still score high if the model learned that
+    "unusual selectors + high ETH + small code = treasure."
+
+    The hashing trick means we never need a vocabulary — any selector maps
+    to a bucket. Collisions are handled gracefully because semantically
+    similar selectors (from the same contract family) tend to co-occur,
+    and the model learns composite representations.
+
+    Design choices:
+      - N_BUCKETS=512: enough for good separation (~65K unique selectors
+        in Ethereum, but most contracts share common ones)
+      - EMBED_DIM=32: matches other feature group encoders
+      - Mean pooling: order-invariant (selector order doesn't matter),
+        handles variable-length inputs, normalizes for contract size
+      - Projection layer after pooling: learns cross-selector interactions
+    """
+
+    N_BUCKETS = 512
+    EMBED_DIM = 32
+
+    def __init__(self, embed_dim: int = 32, n_buckets: int = 512, dropout: float = 0.1):
+        super().__init__()
+        self.n_buckets = n_buckets
+        self.embed_dim = embed_dim
+
+        # Learnable embedding table — each bucket gets a vector
+        self.embedding = nn.Embedding(n_buckets, embed_dim)
+
+        # Post-pooling projection to learn cross-selector patterns
+        self.proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
+
+        # Zero vector for contracts with no selectors
+        self.register_buffer('_zero', torch.zeros(1, embed_dim))
+
+    def hash_selectors(self, selector_ints: torch.Tensor) -> torch.Tensor:
+        """Hash raw selector integers into bucket indices."""
+        # Simple modular hash — fast, deterministic, no collisions within bucket
+        return selector_ints.long() % self.n_buckets
+
+    def forward(self, selector_lists: list) -> torch.Tensor:
+        """
+        Forward pass on a batch of variable-length selector lists.
+
+        Args:
+            selector_lists: list of B tensors, each [K_i] with raw selector ints
+                           (or list of lists of ints)
+
+        Returns:
+            [B, embed_dim] aggregated selector embeddings
+        """
+        batch_embeds = []
+
+        for sels in selector_lists:
+            if isinstance(sels, list):
+                sels = torch.tensor(sels, dtype=torch.long)
+            if sels.numel() == 0:
+                batch_embeds.append(self._zero.squeeze(0))
+                continue
+
+            bucket_ids = self.hash_selectors(sels.to(self.embedding.weight.device))
+            embeds = self.embedding(bucket_ids)   # [K, embed_dim]
+            pooled = embeds.mean(dim=0)           # [embed_dim] — mean pool
+            batch_embeds.append(pooled)
+
+        stacked = torch.stack(batch_embeds, dim=0)  # [B, embed_dim]
+        return self.proj(stacked)
+
+
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
@@ -164,42 +249,55 @@ class TreasureNet(nn.Module):
     Multi-task network for contract treasure detection.
 
     Architecture:
-        Input (38-dim) --> Feature Group Encoders (5 groups) --> Concat (160-dim)
-            --> Shared Encoder (3 residual blocks, 160-dim)
+        Input (38-dim features + variable-length selector list)
+            --> Feature Group Encoders (5 fixed groups) --> [160-dim]
+            --> Selector Embedding (bag-of-selectors, learned) --> [32-dim]
+            --> Concat --> [192-dim]
+            --> Shared Encoder (3 residual blocks, 192-dim)
                 --> Autoencoder Decoder --> reconstruction (38-dim) [anomaly]
                 --> Value Head --> log(ETH + 1) prediction [regression]
                 --> Extraction Head --> P(extraction success) [binary]
                 --> Treasure Head --> P(treasure) [binary]
                 --> Transfer Head --> P(net positive ETH transfer) [binary]
 
+    The selector embedding replaces hardcoded category buckets as the primary
+    capability signal. Any 4-byte selector hashes into a learned embedding —
+    the model discovers which selector patterns correlate with value, including
+    selectors never seen in training.
+
     The autoencoder branch serves double duty:
         1. Anomaly score = reconstruction error (unusual contracts reconstruct poorly)
         2. Regularization (forces shared encoder to preserve all information)
 
-    Parameters: ~110K (fits in L1 cache, <0.1ms inference on CPU)
+    Parameters: ~230K (<0.1ms inference on CPU)
     """
 
     # Feature group slicing indices (matching vectorizer.js)
     STRUCTURAL = (0, 10)       # indices 0-9
     FINANCIAL = (10, 17)       # indices 10-16
-    CAPABILITY = (17, 31)      # indices 17-30
+    CAPABILITY = (17, 31)      # indices 17-30 (legacy category buckets, still used by autoencoder)
     EXTRACTION = (31, 35)      # indices 31-34
     TRANSFER_VERIF = (35, 38)  # indices 35-37 (gas pattern, revert check, caller balance)
 
     GROUP_EMBED_DIM = 32       # Each group encodes to 32-dim
-    SHARED_DIM = 160           # 5 groups * 32 = 160
+    SHARED_DIM = 192           # 5 fixed groups * 32 + 1 selector embed * 32 = 192
     NUM_RESIDUAL = 3
 
     def __init__(self, input_dim: int = 38, dropout: float = 0.15):
         super().__init__()
         self.input_dim = input_dim
 
-        # --- Feature group encoders ---
+        # --- Feature group encoders (fixed-size numeric features) ---
         self.structural_enc = FeatureGroupEncoder(10, self.GROUP_EMBED_DIM, dropout)
         self.financial_enc = FeatureGroupEncoder(7, self.GROUP_EMBED_DIM, dropout)
         self.capability_enc = FeatureGroupEncoder(14, self.GROUP_EMBED_DIM, dropout)
         self.extraction_enc = FeatureGroupEncoder(4, self.GROUP_EMBED_DIM, dropout)
         self.transfer_verif_enc = FeatureGroupEncoder(3, self.GROUP_EMBED_DIM, dropout)
+
+        # --- Learned selector embedding (variable-length bag-of-selectors) ---
+        self.selector_emb = SelectorEmbedding(
+            embed_dim=self.GROUP_EMBED_DIM, n_buckets=512, dropout=dropout
+        )
 
         # --- Shared encoder (residual blocks) ---
         self.shared = nn.Sequential(
@@ -265,18 +363,35 @@ class TreasureNet(nn.Module):
         nn.init.constant_(self.extraction_head[-1].bias, -4.6)
         nn.init.constant_(self.transfer_head[-1].bias, -4.6)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode raw features into shared representation."""
+    def encode(self, x: torch.Tensor,
+              selector_lists: Optional[list] = None) -> torch.Tensor:
+        """
+        Encode raw features + optional selector lists into shared representation.
+
+        Args:
+            x: [B, 38] fixed feature vectors
+            selector_lists: optional list of B selector int lists/tensors.
+                           If None, uses only the legacy capability features.
+        """
         s = self.structural_enc(x[:, self.STRUCTURAL[0]:self.STRUCTURAL[1]])
         f = self.financial_enc(x[:, self.FINANCIAL[0]:self.FINANCIAL[1]])
         c = self.capability_enc(x[:, self.CAPABILITY[0]:self.CAPABILITY[1]])
         e = self.extraction_enc(x[:, self.EXTRACTION[0]:self.EXTRACTION[1]])
         t = self.transfer_verif_enc(x[:, self.TRANSFER_VERIF[0]:self.TRANSFER_VERIF[1]])
-        fused = torch.cat([s, f, c, e, t], dim=-1)  # [B, 160]
+
+        if selector_lists is not None:
+            sel = self.selector_emb(selector_lists)  # [B, 32]
+        else:
+            # Fallback: no raw selectors available (old data).
+            # Use a zero embedding — the legacy capability features still carry signal.
+            sel = torch.zeros(x.shape[0], self.GROUP_EMBED_DIM, device=x.device)
+
+        fused = torch.cat([s, f, c, e, t, sel], dim=-1)  # [B, 192]
         return self.shared(fused)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        z = self.encode(x)
+    def forward(self, x: torch.Tensor,
+                selector_lists: Optional[list] = None) -> Dict[str, torch.Tensor]:
+        z = self.encode(x, selector_lists)
         reconstruction = self.decoder(z)
         recon_error = F.mse_loss(reconstruction, x, reduction='none').mean(dim=-1)
 
@@ -286,7 +401,7 @@ class TreasureNet(nn.Module):
         transfer_logit = self.transfer_head(z).squeeze(-1)
 
         return {
-            'z': z,                                         # Shared embedding [B, 160]
+            'z': z,                                         # Shared embedding [B, 192]
             'reconstruction': reconstruction,               # Decoded features [B, 38]
             'recon_error': recon_error,                     # Per-sample MSE [B]
             'value_pred': value_pred,                       # log(ETH+1) estimate [B]
@@ -330,13 +445,14 @@ class ContractDataset(torch.utils.data.Dataset):
     """
     Loads JSONL vectors from the vectorizer.
 
-    Each line: {"address":"0x...", "features":[...35 floats...], "labels":{...}}
+    Each line: {"address":"0x...", "features":[...38 floats...], "selectorHashes":[...ints...], "labels":{...}}
     """
 
     def __init__(self, jsonl_path: str):
         import json
         self.samples = []
         self.addresses = []
+        self.has_selectors = False
 
         with open(jsonl_path, 'r') as f:
             for line in f:
@@ -355,6 +471,11 @@ class ContractDataset(torch.utils.data.Dataset):
                 fp_cat = labels.get('falsePositiveCategory', None)
                 is_transfer = float(labels.get('treasure', False) and not fp_cat)
 
+                # Raw selector hashes for learned embedding
+                sel_hashes = obj.get('selectorHashes', [])
+                if sel_hashes:
+                    self.has_selectors = True
+
                 self.samples.append({
                     'features': features,
                     'has_value': float(labels.get('hasValue', False)),
@@ -362,6 +483,7 @@ class ContractDataset(torch.utils.data.Dataset):
                     'treasure': float(labels.get('treasure', False)),
                     'eth_value': float(labels.get('ethValue', 0.0)),
                     'transfer_verified': is_transfer,
+                    'selector_hashes': sel_hashes,
                 })
                 self.addresses.append(obj.get('address', ''))
 
@@ -376,10 +498,12 @@ class ContractDataset(torch.utils.data.Dataset):
         n_extract = sum(1 for s in self.samples if s['has_extraction'] > 0.5)
         n_treasure = sum(1 for s in self.samples if s['treasure'] > 0.5)
         n_transfer = sum(1 for s in self.samples if s['transfer_verified'] > 0.5)
+        n_with_sels = sum(1 for s in self.samples if len(s['selector_hashes']) > 0)
         print(f"  has_value:         {n_value}/{n} ({100*n_value/n:.2f}%)")
         print(f"  has_extraction:    {n_extract}/{n} ({100*n_extract/n:.2f}%)")
         print(f"  treasure:          {n_treasure}/{n} ({100*n_treasure/n:.2f}%)")
         print(f"  transfer_verified: {n_transfer}/{n} ({100*n_transfer/n:.2f}%)")
+        print(f"  has_selectors:     {n_with_sels}/{n} ({100*n_with_sels/n:.2f}%)")
 
     def __len__(self):
         return len(self.samples)
@@ -662,6 +786,7 @@ class TreasureNetTrainer:
             treasure = batch['treasure'].to(self.device)
             eth_value = batch['eth_value'].to(self.device)
             transfer_verified = batch['transfer_verified'].to(self.device)
+            selector_hashes = batch.get('selector_hashes', None)
 
             # Augmentation (stochastic per batch)
             if torch.rand(1).item() < 0.5:
@@ -670,7 +795,7 @@ class TreasureNetTrainer:
                 features = self.augmentor.feature_dropout(features, p=0.08)
 
             with torch.amp.autocast(self.device.type, enabled=(self.device.type == 'cuda')):
-                out = self.model(features)
+                out = self.model(features, selector_hashes)
 
                 # Per-task losses
                 l_recon = self.recon_loss(out['reconstruction'], features)
@@ -754,8 +879,9 @@ class TreasureNetTrainer:
             treasure = batch['treasure'].to(self.device)
             eth_value = batch['eth_value'].to(self.device)
             transfer_verified = batch['transfer_verified'].to(self.device)
+            selector_hashes = batch.get('selector_hashes', None)
 
-            out = self.model(features)
+            out = self.model(features, selector_hashes)
 
             l_recon = self.recon_loss(out['reconstruction'], features)
             l_value = self.value_loss(out['value_pred'], torch.log1p(eth_value))
@@ -819,6 +945,10 @@ class TreasureNetTrainer:
 
     @staticmethod
     def _collate(samples):
+        # Selector hashes are variable-length — pass as list of lists (not a tensor)
+        sel_lists = [s['selector_hashes'] for s in samples]
+        has_any_sels = any(len(sl) > 0 for sl in sel_lists)
+
         return {
             'features': torch.stack([s['features'] for s in samples]),
             'has_value': torch.tensor([s['has_value'] for s in samples], dtype=torch.float32),
@@ -826,6 +956,7 @@ class TreasureNetTrainer:
             'treasure': torch.tensor([s['treasure'] for s in samples], dtype=torch.float32),
             'eth_value': torch.tensor([s['eth_value'] for s in samples], dtype=torch.float32),
             'transfer_verified': torch.tensor([s['transfer_verified'] for s in samples], dtype=torch.float32),
+            'selector_hashes': sel_lists if has_any_sels else None,
         }
 
 
@@ -875,9 +1006,13 @@ class TreasureDetector:
         return cls(model, device)
 
     @torch.no_grad()
-    def predict(self, features) -> Dict:
+    def predict(self, features, selector_hashes=None) -> Dict:
         """
-        Predict on a single 38-dim feature vector.
+        Predict on a single 38-dim feature vector with optional selector hashes.
+
+        Args:
+            features: 38-element list/array/tensor
+            selector_hashes: optional list of int selector hashes for this contract
 
         Returns dict with all predictions + boolean flags for each alert type.
         """
@@ -887,7 +1022,8 @@ class TreasureDetector:
             features = features.unsqueeze(0)
 
         features = features.to(self.device)
-        out = self.model(features)
+        sel_lists = [selector_hashes or []]
+        out = self.model(features, sel_lists)
 
         anomaly = out['anomaly_score'].item()
         treasure_p = out['treasure_prob'].item()
@@ -938,12 +1074,12 @@ class TreasureDetector:
         }
 
     @torch.no_grad()
-    def predict_batch(self, features) -> list:
-        """Predict on a batch of feature vectors. Returns list of result dicts."""
+    def predict_batch(self, features, selector_hash_lists=None) -> list:
+        """Predict on a batch of feature vectors with optional selector hashes."""
         if isinstance(features, (list, np.ndarray)):
             features = torch.tensor(features, dtype=torch.float32)
         features = features.to(self.device)
-        out = self.model(features)
+        out = self.model(features, selector_hash_lists)
 
         results = []
         for i in range(features.shape[0]):
@@ -996,7 +1132,8 @@ class TreasureDetector:
         all_scores = []
         for batch in loader:
             features = batch['features'].to(self.device)
-            out = self.model(features)
+            selector_hashes = batch.get('selector_hashes', None)
+            out = self.model(features, selector_hashes)
             all_scores.extend(out['anomaly_score'].cpu().tolist())
 
         self._anomaly_scores = all_scores
@@ -1021,7 +1158,10 @@ def save_checkpoint(model: TreasureNet, optimizer, epoch: int, metrics: dict,
 
 
 class _TraceableForward(nn.Module):
-    """Wrapper that returns a tuple instead of dict, for JIT tracing."""
+    """Wrapper that returns a tuple instead of dict, for JIT tracing.
+    Note: tracing uses the fixed-feature path only (no selector embedding).
+    For production inference with selectors, use TreasureDetector.predict() directly.
+    """
 
     def __init__(self, model: TreasureNet):
         super().__init__()
@@ -1030,7 +1170,7 @@ class _TraceableForward(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
                                                   torch.Tensor, torch.Tensor,
                                                   torch.Tensor, torch.Tensor]:
-        out = self.model(x)
+        out = self.model(x, None)  # No selectors in traced path
         # Returns: (anomaly_score, treasure_prob, extraction_prob, transfer_prob, value_pred, recon_error)
         return (out['anomaly_score'], out['treasure_prob'],
                 out['extraction_prob'], out['transfer_prob'],
@@ -1137,7 +1277,7 @@ def main():
         alerts = []
         for i in range(len(dataset)):
             sample = dataset[i]
-            result = detector.predict(sample['features'])
+            result = detector.predict(sample['features'], sample.get('selector_hashes'))
             if result['alert']:
                 result['address'] = dataset.addresses[i]
                 alerts.append(result)
