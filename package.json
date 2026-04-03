@@ -1,0 +1,20 @@
+{
+  "name": "rpcagg",
+  "version": "1.0.0",
+  "description": "AIO RPC aggregator — funnels 20+ Base RPCs into one local endpoint",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "start:race": "STRATEGY=race node index.js",
+    "start:robin": "STRATEGY=round-robin node index.js",
+    "start:debug": "LOG_LEVEL=debug node index.js",
+    "test": "node test.js"
+  },
+  "keywords": ["rpc", "aggregator", "base", "ethereum", "proxy"],
+  "author": "drlor",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
