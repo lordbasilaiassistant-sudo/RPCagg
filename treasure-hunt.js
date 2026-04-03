@@ -348,7 +348,14 @@ class TreasureHunter {
 
       // Simulate ALL selectors on contracts with value
       if (hasValue) {
-        const simResults = await this.simulateAllSelectors(c);
+        let simResults;
+        try {
+          simResults = await this.simulateAllSelectors(c);
+        } catch (err) {
+          log.warn(`sim failed for ${c.address}: ${err.message}`);
+          this.vectorizer.vectorize(c);
+          continue;
+        }
         c.simResults = simResults;
 
         // Check which extraction functions succeed
@@ -425,7 +432,7 @@ class TreasureHunter {
       }
     }
 
-    // Batch simulate via eth_call
+    // Batch simulate via eth_call — wrapped in try/catch per batch
     const BATCH = 25;
     for (let i = 0; i < calls.length; i += BATCH) {
       const chunk = calls.slice(i, i + BATCH);
@@ -434,7 +441,16 @@ class TreasureHunter {
         params: [{ to: address, data: c.callData, from: OUR_WALLET }, 'latest'],
       }));
 
-      const responses = await this.rpc.batch(rpcCalls);
+      let responses;
+      try {
+        responses = await this.rpc.batch(rpcCalls);
+      } catch (err) {
+        // Entire batch failed — mark all as failed, continue
+        for (const c of chunk) {
+          results.push({ selector: c.selector, name: c.name, callData: c.callData, success: false, result: null, error: err.message });
+        }
+        continue;
+      }
 
       for (let j = 0; j < chunk.length; j++) {
         const resp = responses[j];

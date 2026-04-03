@@ -34,8 +34,12 @@ class RpcClient {
   async batch(calls) {
     if (calls.length === 0) return [];
     if (calls.length === 1) {
-      const r = await this.call(calls[0].method, calls[0].params);
-      return [r];
+      try {
+        const r = await this.call(calls[0].method, calls[0].params);
+        return [r];
+      } catch (err) {
+        return [{ error: { message: err.message, code: err.code } }];
+      }
     }
 
     const body = calls.map((c, i) => ({

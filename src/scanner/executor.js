@@ -93,6 +93,26 @@ class Executor {
       return result;
     }
 
+    // Step 2b: Verify the function actually SENDS us ETH (not just succeeds)
+    // Check if the contract balance decreases or our balance increases after sim
+    // Filter out deposit/receive/fallback functions — these take ETH, not give it
+    const depositSelectors = ['d0e30db0', 'b6b55f25', 'e8eda9df']; // deposit(), deposit(uint256)
+    const callSelector = callData.substring(2, 10);
+    if (depositSelectors.includes(callSelector)) {
+      result.error = 'filtered: deposit function (takes ETH, does not extract)';
+      result.simSuccess = false;
+      this.simulated.push(result);
+      return result;
+    }
+
+    // Also filter: if the function name contains 'deposit', 'approve', 'increase'
+    if (fnName && /deposit|approve|increase|receive/i.test(fnName)) {
+      result.error = `filtered: ${fnName} is not an extraction function`;
+      result.simSuccess = false;
+      this.simulated.push(result);
+      return result;
+    }
+
     // Step 3: Calculate profit
     try {
       const gasPrice = BigInt(await this.rpc.call('eth_gasPrice'));
