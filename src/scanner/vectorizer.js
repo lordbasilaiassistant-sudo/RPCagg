@@ -42,8 +42,18 @@ const DEAD_ADDRESSES = new Set([
   '0x0000000000000000000000000000000000000001',
 ]);
 
-// Exploit severity encoding
-const SEVERITY_ENCODING = { critical: 1.0, high: 0.7, medium: 0.4, low: 0.1 };
+// Pattern names from analyzeExploitPatterns() output, in exact order.
+// Each result object has { pattern, detected, exploitable, severity }.
+const EXPLOIT_PATTERN_ORDER = [
+  'reinitialization',         // [0] -> feature 38
+  'metamorphic_create2',      // [1] -> feature 39
+  'admin_slot_collision',     // [2] -> feature 40
+  'delegatecall_user_target', // [3] -> feature 41
+  'unchecked_return',         // [4] -> feature 42
+  'tx_origin_auth',           // [5] -> feature 43
+  'unprotected_owner',        // [6] -> feature 44
+  'abandoned_timelock',       // [7] -> feature 45
+];
 
 class Vectorizer {
   constructor(outputDir) {
@@ -105,35 +115,34 @@ class Vectorizer {
     features.push(contract.withdrawRevertsForCaller ? 1 : 0);           // 36: withdraw/exit reverts for our address
     features.push(logNormalize(contract.callerBalanceInContract || 0));  // 37: our balanceOf() in the contract (log-normalized)
 
-    // --- Ownership status features (indices 38-41) ---
-    // From storage analysis: who owns this contract and what does that imply?
+    // --- Exploit pattern features (indices 38-45) ---
+    // Directly from analyzeExploitPatterns() — 8 vulnerability detectors.
+    // Input: contract.exploitPatterns = array of { pattern, detected, exploitable, severity }
+    // Each feature is 1 if the pattern was detected AND exploitable, 0 otherwise.
+    const exploitResults = contract.exploitPatterns || [];
+    const exploitMap = new Map(exploitResults.map(r => [r.pattern, r]));
+    for (const patternName of EXPLOIT_PATTERN_ORDER) {
+      const r = exploitMap.get(patternName);
+      features.push(r && r.detected ? 1 : 0);                           // 38-45: exploit pattern flags
+    }
+
+    // --- Ownership status features (indices 46-49) ---
+    // From solidity-expert storage analysis: who owns this contract?
     const owner = (contract.owner || '').toLowerCase();
     const deployer = (contract.deployer || '').toLowerCase();
-    features.push(owner === '0x' + '0'.repeat(40) ? 1 : 0);            // 38: owner is zero address (renounced)
-    features.push(DEAD_ADDRESSES.has(owner) && owner !== '0x' + '0'.repeat(40) ? 1 : 0); // 39: owner is dead/burn address
-    features.push(owner && deployer && owner === deployer ? 1 : 0);     // 40: owner == deployer
-    features.push(contract.ownerIsEOA ? 1 : 0);                        // 41: owner is an EOA (not a contract)
-
-    // --- Exploit pattern features (indices 42-48) ---
-    // From exploit-patterns.js analysis results
-    const exploits = contract.exploitResults || {};
-    features.push(exploits.reinitializable ? 1 : 0);                    // 42: initialize() callable (re-init attack)
-    features.push(exploits.hasCreate2 ? 1 : 0);                         // 43: CREATE2 metamorphic potential
-    features.push(exploits.delegatecallExploitable ? 1 : 0);            // 44: user-controlled delegatecall target
-    features.push(exploits.txOriginAuth ? 1 : 0);                       // 45: tx.origin auth bypass
-    features.push(exploits.uncheckedReturn ? 1 : 0);                    // 46: unchecked ERC-20 transfer returns
-    features.push(exploits.unprotectedOwner ? 1 : 0);                   // 47: unprotected storage slot 0 owner
-    features.push(encodeExploitSeverity(exploits.maxSeverity));          // 48: worst exploit severity (0-1)
-
-    // --- Deployer profile features (indices 49-52) ---
-    // From chain-analyst: deployer behavior predicts contract abandonment
-    const dep = contract.deployerProfile || {};
-    features.push(normalize(dep.nonce || 0, 0, 10000));                  // 49: deployer nonce (serial deployer detection)
-    features.push(normalize(dep.dormancyDays || 0, 0, 730));             // 50: days since deployer's last tx (0-2 years)
-    features.push(normalize(dep.contractCount || 0, 0, 500));            // 51: number of contracts deployed
-    features.push(dep.isContract ? 1 : 0);                              // 52: deployer is a contract (factory deployment)
+    features.push(owner === '0x' + '0'.repeat(40) ? 1 : 0);            // 46: owner is zero (renounced — locked forever)
+    features.push(DEAD_ADDRESSES.has(owner) && owner !== '0x' + '0'.repeat(40) ? 1 : 0); // 47: owner is dead (0xdead — locked forever)
+    features.push(owner && deployer && owner === deployer ? 1 : 0);     // 48: owner is deployer (only deployer can extract)
+    features.push(contract.deployerDormant ? 1 : 0);                    // 49: deployer inactive > 6 months
 
     // Labels (for supervised training)
+    const exploitDetected = exploitResults.some(r => r.detected);
+    const maxSeverity = exploitResults.reduce((worst, r) => {
+      if (!r.detected) return worst;
+      const rank = { critical: 4, high: 3, medium: 2, low: 1 };
+      return (rank[r.severity] || 0) > (rank[worst] || 0) ? r.severity : worst;
+    }, 'none');
+
     const labels = {
       hasValue: ethBal > 0 || Object.keys(tokenBals).length > 0,
       hasCallableExtraction: simExtraction > 0,
@@ -142,9 +151,9 @@ class Vectorizer {
       proxyType: contract.proxyType || 'none',
       // Enriched labels from team findings
       ownershipStatus: classifyOwnership(owner, deployer, contract),
-      exploitDetected: Object.values(exploits).some(v => v === true),
-      maxExploitSeverity: exploits.maxSeverity || 'none',
-      deployerDormant: (dep.dormancyDays || 0) > 180,
+      exploitDetected,
+      maxExploitSeverity: maxSeverity,
+      deployerDormant: !!contract.deployerDormant,
     };
 
     // Raw selector hashes for learned embedding (bag-of-selectors input).
