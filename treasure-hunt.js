@@ -28,6 +28,11 @@ const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const ZERO_ADDR = '0x' + '0'.repeat(40);
 const OUR_WALLET = process.env.EXECUTOR_WALLET || '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
 
+// EIP-1967 storage slots for proxy resolution
+const IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+const ADMIN_SLOT = '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103';
+const BEACON_SLOT = '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50';
+
 // Known ERC-20s on Base with liquidity
 const TOP_TOKENS = [
   { symbol: 'WETH',  addr: '0x4200000000000000000000000000000000000006' },
@@ -340,7 +345,49 @@ class TreasureHunter {
         chunk[j].isProxy = hex.includes('363d3d373d3d3d363d73') || opcodes.has(0xf4); // DELEGATECALL
         chunk[j].hasSelfdestruct = opcodes.has(0xff); // SELFDESTRUCT
 
+        // EIP-1167 minimal proxy: extract implementation from bytecode
+        if (hex.startsWith('363d3d373d3d3d363d73') && hex.endsWith('5af43d82803e903d91602b57fd5bf3')) {
+          chunk[j].proxyType = 'eip1167-minimal';
+          chunk[j].implementation = '0x' + hex.substring(20, 60);
+        }
+
         this.scanned++;
+      }
+
+      // Resolve EIP-1967 proxy targets for contracts flagged as proxies
+      const proxies = chunk.filter(c => c.isProxy && !c.implementation);
+      if (proxies.length > 0) {
+        const slotCalls = [];
+        for (const p of proxies) {
+          slotCalls.push(
+            { method: 'eth_getStorageAt', params: [p.address, IMPL_SLOT, 'latest'] },
+            { method: 'eth_getStorageAt', params: [p.address, ADMIN_SLOT, 'latest'] },
+            { method: 'eth_getStorageAt', params: [p.address, BEACON_SLOT, 'latest'] },
+          );
+        }
+        try {
+          const slotResults = await this.rpc.batch(slotCalls);
+          for (let k = 0; k < proxies.length; k++) {
+            const implRaw = slotResults[k * 3];
+            const adminRaw = slotResults[k * 3 + 1];
+            const beaconRaw = slotResults[k * 3 + 2];
+            const impl = slotToAddress(implRaw);
+            const admin = slotToAddress(adminRaw);
+            const beacon = slotToAddress(beaconRaw);
+            if (impl) {
+              proxies[k].implementation = impl;
+              proxies[k].proxyType = 'eip1967';
+            }
+            if (admin) proxies[k].admin = admin;
+            if (beacon) {
+              proxies[k].beacon = beacon;
+              proxies[k].proxyType = 'beacon';
+            }
+            if (!proxies[k].proxyType) proxies[k].proxyType = 'delegatecall';
+          }
+        } catch (err) {
+          log.debug(`proxy slot resolution failed: ${err.message}`);
+        }
       }
 
       if (i % 100 === 0 && i > 0) {
@@ -586,6 +633,14 @@ function extractOpcodes(hex) {
     i += 2;
   }
   return opcodes;
+}
+
+function slotToAddress(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const hex = raw.replace('0x', '').padStart(64, '0');
+  const addr = '0x' + hex.slice(-40);
+  if (addr === ZERO_ADDR) return null;
+  return addr;
 }
 
 function padAddress(addr) {
