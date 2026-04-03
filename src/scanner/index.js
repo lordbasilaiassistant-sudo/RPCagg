@@ -14,6 +14,7 @@ const { analyzeExploitPatterns, quickBytecodeFlags } = require('./exploit-patter
 const { TokenDiscovery, KNOWN_TOKENS } = require('./token-discovery');
 const { DexPricer, FACTORIES: DEX_FACTORIES, WETH, STABLES } = require('./dex-pricer');
 const { BytecodeSimilarity, extractOpcodes, computeNgrams, jaccardSimilarity } = require('./bytecode-similarity');
+const { AnomalyDetector } = require('./anomaly-detector');
 
 module.exports = {
   RpcClient,

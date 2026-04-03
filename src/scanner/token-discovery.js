@@ -37,8 +37,9 @@ const KNOWN_TOKENS = [
 ];
 
 class TokenDiscovery {
-  constructor(rpcClient) {
+  constructor(rpcClient, dexPricer = null) {
     this.rpc = rpcClient;
+    this.pricer = dexPricer;
     this._tokenMetaCache = new Map();
     // Pre-fill cache with known tokens
     for (const t of KNOWN_TOKENS) {
@@ -94,6 +95,35 @@ class TokenDiscovery {
     }
 
     return result;
+  }
+
+  /**
+   * Discover tokens AND price them via DEX pairs. Requires DexPricer.
+   * @param {string} contractAddr
+   * @param {Object} opts - Same as discover(), plus:
+   * @param {number} opts.minEthValue - Minimum ETH value to include (default 0)
+   * @returns {Object} Map with ethValue and usdValue added to each token entry
+   */
+  async discoverAndPrice(contractAddr, opts = {}) {
+    const tokens = await this.discover(contractAddr, opts);
+    if (!this.pricer || Object.keys(tokens).length === 0) return tokens;
+
+    const minVal = opts.minEthValue || 0;
+
+    for (const [tokenAddr, info] of Object.entries(tokens)) {
+      const val = await this.pricer.valueInEth(tokenAddr, info.balance, info.decimals);
+      if (val) {
+        info.ethValue = val.ethValue;
+        info.usdValue = val.usdValue;
+        info.priceSource = val.source;
+      }
+      // Remove tokens below minimum value threshold
+      if (minVal > 0 && (!info.ethValue || info.ethValue < minVal)) {
+        delete tokens[tokenAddr];
+      }
+    }
+
+    return tokens;
   }
 
   /**

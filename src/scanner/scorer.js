@@ -14,7 +14,14 @@
  */
 
 const { makeLogger } = require('../logger');
+const { SELECTOR_CATEGORIES } = require('./vectorizer');
 const log = makeLogger('scorer');
+
+// Flatten all known selectors from vectorizer categories into a fast lookup Set.
+// Any selector NOT in this set is "unknown" — our MEV edge.
+const KNOWN_SELECTORS = new Set(
+  Object.values(SELECTOR_CATEGORIES).flat()
+);
 
 // Weights for each dimension (tuned by hand, will be replaced by NN weights after training)
 const WEIGHTS = {
@@ -184,6 +191,166 @@ class Scorer {
     if (hasRenounce) vuln += 0.1;
 
     return Math.min(1, vuln);
+  }
+
+  /**
+   * MEV Competition Score — models the likelihood that this opportunity has NOT
+   * already been sniped by MEV bots or other searchers.
+   *
+   * Core insight: the easier an opportunity is to find, the more likely it's
+   * already been taken. Our edge is in the OBSCURE — contracts that other
+   * scanners can't classify.
+   *
+   * Formula: mevScore = obscurity * ageFactor * complexityBonus * (1 - patternPenalty)
+   *
+   * Components:
+   *   obscurity      [0,1] — fraction of selectors not in any known category
+   *   ageFactor      [0,1] — penalizes very new contracts, boosts old ones
+   *   complexityBonus[0,1] — unusual code size, proxy chains, non-standard bytecode
+   *   patternPenalty [0,1] — how well-known the contract pattern is (ERC-20, Uniswap, etc.)
+   *
+   * A standard ERC-20 with withdraw() deployed yesterday: mevScore ≈ 0.05 (snipeable)
+   * A weird proxy with unknown selectors deployed 8 months ago: mevScore ≈ 0.85 (our sweet spot)
+   */
+  _mevScore(c) {
+    const obscurity = this._obscurity(c);
+    const ageFactor = this._mevAgeFactor(c);
+    const complexityBonus = this._complexityBonus(c);
+    const patternPenalty = this._patternPenalty(c);
+
+    // Multiplicative combination: all factors must contribute.
+    // (1 - patternPenalty) inverts it: high penalty = low score.
+    const raw = obscurity * ageFactor * complexityBonus * (1 - patternPenalty);
+
+    // Rescale: raw is in [0, 1] but tends to cluster low due to multiplication.
+    // Apply sqrt to spread the distribution and give more differentiation.
+    return Math.min(1, Math.sqrt(raw));
+  }
+
+  /**
+   * Obscurity: what fraction of this contract's selectors are unknown?
+   * Unknown = not in any SELECTOR_CATEGORIES from vectorizer.
+   * High obscurity = MEV bots don't know what these functions do = our edge.
+   */
+  _obscurity(c) {
+    const sels = c.selectors || [];
+    if (sels.length === 0) return 0.5; // no selectors = ambiguous, moderate score
+
+    let unknownCount = 0;
+    for (const sel of sels) {
+      if (!KNOWN_SELECTORS.has(sel)) unknownCount++;
+    }
+
+    // Weighted: 100% unknown = 1.0; 100% known = 0.1 (not zero — known functions
+    // can still be valuable if the contract pattern itself is unusual)
+    const unknownFrac = unknownCount / sels.length;
+    return 0.1 + 0.9 * unknownFrac;
+  }
+
+  /**
+   * MEV-adjusted age factor. Different from _ageScore:
+   *   - Very new (< 1 day / ~43K blocks): PENALIZED — if nobody took the ETH
+   *     in the first hours, it's likely locked/inaccessible. MEV bots hit new
+   *     contracts within seconds.
+   *   - Medium (1 day - 6 months): NEUTRAL — unclear signal
+   *   - Old (> 6 months / ~7.8M blocks): BOOSTED — forgotten + complex = our target
+   *
+   * Uses a sigmoid-shaped curve:
+   *   f(age) = sigmoid(k * (age - midpoint))
+   *   where midpoint = 3 months, so contracts older than 3 months score > 0.5
+   */
+  _mevAgeFactor(c) {
+    if (!c.blockNumber) return 0.5;
+    const head = c._headBlock || 50000000;
+    const ageBlocks = head - c.blockNumber;
+
+    // Base: ~2 blocks/sec
+    const DAY = 43200;     // ~0.5 days actually, but close enough for Base's 2s blocks
+    const MONTH = DAY * 30;
+
+    // Very new: penalty ramp
+    if (ageBlocks < DAY) {
+      // Linear from 0.05 (brand new) to 0.3 (1 day old)
+      return 0.05 + 0.25 * (ageBlocks / DAY);
+    }
+
+    // Sigmoid: midpoint at 3 months, steepness k=4/MONTH
+    // At 6 months: ~0.88; at 1 year: ~0.98; at 1 day: ~0.12
+    const midpoint = 3 * MONTH;
+    const k = 4 / MONTH;
+    return 1 / (1 + Math.exp(-k * (ageBlocks - midpoint)));
+  }
+
+  /**
+   * Complexity bonus: unusual bytecode characteristics.
+   * Complex = harder for automated scanners to analyze = less competition.
+   */
+  _complexityBonus(c) {
+    let bonus = 0.3; // baseline
+
+    // Proxy chains add complexity (other scanners often fail on proxies)
+    if (c.isProxy) bonus += 0.2;
+
+    // Unusual code size: very small (bare vault?) or very large (complex logic)
+    if (c.codeSize) {
+      if (c.codeSize < 200) bonus += 0.15;        // minimal bytecode — unusual
+      else if (c.codeSize > 15000) bonus += 0.15;  // very complex
+    }
+
+    // Many selectors = complex interface = harder to auto-analyze
+    const nSels = c.selectors?.length || 0;
+    if (nSels > 20) bonus += 0.1;
+    if (nSels > 50) bonus += 0.1;
+
+    // Has selfdestruct = nonstandard lifecycle
+    if (c.hasSelfdestruct) bonus += 0.1;
+
+    // Is a factory = CREATE2 complexity
+    if (c.isFactory) bonus += 0.1;
+
+    return Math.min(1, bonus);
+  }
+
+  /**
+   * Pattern penalty: how well-known and MEV-targeted is this contract type?
+   * High penalty = standard pattern = MEV bots already monitor it.
+   *
+   * Patterns detected by selector fingerprinting:
+   *   - ERC-20 token: transfer + approve + totalSupply = very standard
+   *   - Uniswap V2 pair: swap + getReserves + mint + burn = heavily monitored
+   *   - Standard staking: stake + withdraw + getReward = well-known
+   *   - Airdrop/claim: claim + merkle proof patterns = bot targets
+   */
+  _patternPenalty(c) {
+    const sels = new Set(c.selectors || []);
+    let penalty = 0;
+
+    // ERC-20 fingerprint: transfer + balanceOf + approve + totalSupply
+    const erc20Sigs = ['a9059cbb', '70a08231', '095ea7b3', '18160ddd'];
+    const erc20Match = erc20Sigs.filter(s => sels.has(s)).length;
+    if (erc20Match >= 3) penalty += 0.3;
+
+    // Uniswap V2 pair: swap + getReserves + token0 + token1
+    const uniV2Sigs = ['022c0d9f', '0902f1ac', '0dfe1681', 'd21220a7'];
+    const uniMatch = uniV2Sigs.filter(s => sels.has(s)).length;
+    if (uniMatch >= 3) penalty += 0.4;
+
+    // Standard staking: stake + withdraw + getReward + earned
+    const stakingSigs = ['a694fc3a', '2e1a7d4d', '3d18b912', '008cc262'];
+    const stakeMatch = stakingSigs.filter(s => sels.has(s)).length;
+    if (stakeMatch >= 3) penalty += 0.2;
+
+    // Standard airdrop: claim + claimed + merkleRoot
+    const airdropSigs = ['4e71d92d', '9e34070f', '2eb4a7ab'];
+    const airMatch = airdropSigs.filter(s => sels.has(s)).length;
+    if (airMatch >= 2) penalty += 0.2;
+
+    // Simple withdraw-only contracts (just withdraw + owner): too obvious
+    if (sels.has('3ccfd60b') && sels.has('8da5cb5b') && sels.size <= 5) {
+      penalty += 0.3;
+    }
+
+    return Math.min(1, penalty);
   }
 
   getTopTargets(n = 20) {
