@@ -1,0 +1,358 @@
+{
+  "version": "3.0.0",
+  "dim": 50,
+  "features": [
+    {
+      "index": 0,
+      "name": "code_size",
+      "group": "structural",
+      "type": "normalized"
+    },
+    {
+      "index": 1,
+      "name": "destroyed",
+      "group": "structural",
+      "type": "binary"
+    },
+    {
+      "index": 2,
+      "name": "is_proxy",
+      "group": "structural",
+      "type": "binary"
+    },
+    {
+      "index": 3,
+      "name": "proxy_type",
+      "group": "structural",
+      "type": "encoded"
+    },
+    {
+      "index": 4,
+      "name": "is_factory",
+      "group": "structural",
+      "type": "binary"
+    },
+    {
+      "index": 5,
+      "name": "has_selfdestruct",
+      "group": "structural",
+      "type": "binary"
+    },
+    {
+      "index": 6,
+      "name": "selector_count",
+      "group": "structural",
+      "type": "normalized"
+    },
+    {
+      "index": 7,
+      "name": "extraction_fn_count",
+      "group": "structural",
+      "type": "normalized"
+    },
+    {
+      "index": 8,
+      "name": "deploy_gas",
+      "group": "structural",
+      "type": "normalized"
+    },
+    {
+      "index": 9,
+      "name": "deploy_block",
+      "group": "structural",
+      "type": "normalized"
+    },
+    {
+      "index": 10,
+      "name": "eth_balance",
+      "group": "financial",
+      "type": "normalized"
+    },
+    {
+      "index": 11,
+      "name": "has_eth",
+      "group": "financial",
+      "type": "binary"
+    },
+    {
+      "index": 12,
+      "name": "weth_balance",
+      "group": "financial",
+      "type": "normalized"
+    },
+    {
+      "index": 13,
+      "name": "usdc_balance",
+      "group": "financial",
+      "type": "normalized"
+    },
+    {
+      "index": 14,
+      "name": "usdbc_balance",
+      "group": "financial",
+      "type": "normalized"
+    },
+    {
+      "index": 15,
+      "name": "dai_balance",
+      "group": "financial",
+      "type": "normalized"
+    },
+    {
+      "index": 16,
+      "name": "has_tokens",
+      "group": "financial",
+      "type": "binary"
+    },
+    {
+      "index": 17,
+      "name": "cap_transfer",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 18,
+      "name": "cap_withdraw",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 19,
+      "name": "cap_deposit",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 20,
+      "name": "cap_swap",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 21,
+      "name": "cap_liquidity",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 22,
+      "name": "cap_governance",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 23,
+      "name": "cap_admin",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 24,
+      "name": "cap_emergency",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 25,
+      "name": "cap_upgrade",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 26,
+      "name": "cap_sweep",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 27,
+      "name": "cap_mint",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 28,
+      "name": "cap_burn",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 29,
+      "name": "cap_pause",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 30,
+      "name": "cap_claim",
+      "group": "capability",
+      "type": "normalized"
+    },
+    {
+      "index": 31,
+      "name": "sim_success_rate",
+      "group": "extraction",
+      "type": "normalized"
+    },
+    {
+      "index": 32,
+      "name": "extraction_success_rate",
+      "group": "extraction",
+      "type": "normalized"
+    },
+    {
+      "index": 33,
+      "name": "successful_sims",
+      "group": "extraction",
+      "type": "normalized"
+    },
+    {
+      "index": 34,
+      "name": "labeled_treasure",
+      "group": "extraction",
+      "type": "binary"
+    },
+    {
+      "index": 35,
+      "name": "flat_gas_fraction",
+      "group": "transfer_verif",
+      "type": "normalized"
+    },
+    {
+      "index": 36,
+      "name": "withdraw_reverts",
+      "group": "transfer_verif",
+      "type": "binary"
+    },
+    {
+      "index": 37,
+      "name": "caller_balance",
+      "group": "transfer_verif",
+      "type": "normalized"
+    },
+    {
+      "index": 38,
+      "name": "reinitializable",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 39,
+      "name": "metamorphic",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 40,
+      "name": "admin_collision",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 41,
+      "name": "delegatecall_vuln",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 42,
+      "name": "unchecked_return",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 43,
+      "name": "txorigin_auth",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 44,
+      "name": "unprotected_owner",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 45,
+      "name": "abandoned_timelock",
+      "group": "exploit",
+      "type": "binary"
+    },
+    {
+      "index": 46,
+      "name": "owner_is_zero",
+      "group": "ownership",
+      "type": "binary"
+    },
+    {
+      "index": 47,
+      "name": "owner_is_dead",
+      "group": "ownership",
+      "type": "binary"
+    },
+    {
+      "index": 48,
+      "name": "owner_is_deployer",
+      "group": "ownership",
+      "type": "binary"
+    },
+    {
+      "index": 49,
+      "name": "deployer_is_dormant",
+      "group": "ownership",
+      "type": "binary"
+    }
+  ],
+  "groups": {
+    "structural": {
+      "start": 0,
+      "end": 10
+    },
+    "financial": {
+      "start": 10,
+      "end": 17
+    },
+    "capability": {
+      "start": 17,
+      "end": 31
+    },
+    "extraction": {
+      "start": 31,
+      "end": 35
+    },
+    "transfer_verif": {
+      "start": 35,
+      "end": 38
+    },
+    "exploit": {
+      "start": 38,
+      "end": 46
+    },
+    "ownership": {
+      "start": 46,
+      "end": 50
+    }
+  },
+  "binary_indices": [
+    1,
+    2,
+    4,
+    5,
+    11,
+    16,
+    34,
+    36,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49
+  ]
+}

@@ -185,11 +185,12 @@ async function phase2_balance(rpc, addresses) {
 
 async function phase3_analyze(rpc, funded) {
   log.info(`PHASE 3: Deep analysis — ${funded.length} funded contracts`);
-  const BATCH = 50;
+  const CODE_BATCH = 50;
 
-  // Batch get code
-  for (let i = 0; i < funded.length; i += BATCH) {
-    const chunk = funded.slice(i, i + BATCH);
+  // 3a: Batch get code via JSON-RPC batch (eth_getCode can't go through Multicall3)
+  log.info('  3a: Fetching bytecode...');
+  for (let i = 0; i < funded.length; i += CODE_BATCH) {
+    const chunk = funded.slice(i, i + CODE_BATCH);
     const calls = chunk.map(c => ({ method: 'eth_getCode', params: [c.address, 'latest'] }));
 
     try {
@@ -213,9 +214,13 @@ async function phase3_analyze(rpc, funded) {
         while ((m = regex.exec(hex)) !== null) sels.add(m[1]);
         chunk[j].selectors = [...sels];
 
-        // EIP-1167 check
-        if (hex.startsWith('363d3d373d3d3d363d73')) {
-          chunk[j].isProxy = true;
+        // Opcode-level proxy/selfdestruct detection
+        const opcodes = extractOpcodes(hex);
+        chunk[j].isProxy = hex.startsWith('363d3d373d3d3d363d73') || opcodes.has(0xf4);
+        chunk[j].hasSelfdestruct = opcodes.has(0xff);
+
+        // EIP-1167 minimal proxy
+        if (hex.startsWith('363d3d373d3d3d363d73') && hex.endsWith('5af43d82803e903d91602b57fd5bf3')) {
           chunk[j].proxyType = 'eip1167-minimal';
           chunk[j].implementation = '0x' + hex.substring(20, 60);
         }
@@ -230,8 +235,58 @@ async function phase3_analyze(rpc, funded) {
     }
   }
 
-  // Sim unknown selectors on funded non-EOF contracts
-  const OUR = process.env.EXECUTOR_WALLET || '0x7a3E312Ec6e20a9F62fE2405938EB9060312E334';
+  // 3b: Multicall3 batch storage slot reads for ALL funded contracts
+  // 4 slots per contract (owner/slot0, impl, admin, beacon) = 4N reads in N/25 mc3 calls
+  log.info('  3b: Reading storage slots via batched RPC...');
+  const SLOT_BATCH = 25; // 25 contracts * 4 slots = 100 calls per batch
+  const activeContracts = funded.filter(c => !c.destroyed);
+
+  for (let i = 0; i < activeContracts.length; i += SLOT_BATCH) {
+    const chunk = activeContracts.slice(i, i + SLOT_BATCH);
+    const slotCalls = [];
+    for (const c of chunk) {
+      slotCalls.push(
+        { method: 'eth_getStorageAt', params: [c.address, '0x0', 'latest'] },
+        { method: 'eth_getStorageAt', params: [c.address, IMPL_SLOT, 'latest'] },
+        { method: 'eth_getStorageAt', params: [c.address, ADMIN_SLOT, 'latest'] },
+        { method: 'eth_getStorageAt', params: [c.address, BEACON_SLOT, 'latest'] },
+      );
+    }
+
+    try {
+      const results = await rpc.batch(slotCalls);
+      for (let j = 0; j < chunk.length; j++) {
+        const slot0 = results[j * 4];
+        const impl = results[j * 4 + 1];
+        const admin = results[j * 4 + 2];
+        const beacon = results[j * 4 + 3];
+
+        chunk[j].slot0Owner = slotToAddress(slot0);
+        const implAddr = slotToAddress(impl);
+        const adminAddr = slotToAddress(admin);
+        const beaconAddr = slotToAddress(beacon);
+
+        if (implAddr) {
+          chunk[j].implementation = implAddr;
+          chunk[j].isProxy = true;
+          chunk[j].proxyType = chunk[j].proxyType || 'eip1967';
+        }
+        if (adminAddr) chunk[j].admin = adminAddr;
+        if (beaconAddr) {
+          chunk[j].beacon = beaconAddr;
+          chunk[j].proxyType = 'beacon';
+        }
+      }
+    } catch (err) {
+      log.warn(`  slot batch failed at ${i}: ${err.message}`);
+    }
+  }
+
+  const proxyCount = funded.filter(c => c.isProxy).length;
+  log.info(`  ${proxyCount} proxies detected, ${Math.ceil(activeContracts.length / SLOT_BATCH)} slot batches`);
+
+  // 3c: Sim unknown selectors on funded non-EOF contracts
+  log.info('  3c: Simulating selectors...');
   let simmed = 0;
 
   for (const c of funded) {
@@ -240,7 +295,7 @@ async function phase3_analyze(rpc, funded) {
     c.callableSelectors = [];
     const simCalls = c.selectors.slice(0, 30).map(sel => ({
       method: 'eth_estimateGas',
-      params: [{ from: OUR, to: c.address, data: '0x' + sel }],
+      params: [{ from: OUR_WALLET, to: c.address, data: '0x' + sel }],
     }));
 
     try {
@@ -264,6 +319,19 @@ async function phase3_analyze(rpc, funded) {
 
   log.info(`  ${simmed} contracts have callable non-view functions`);
   return funded;
+}
+
+// Walk bytecode at the opcode level, skipping PUSH data bytes.
+function extractOpcodes(hex) {
+  const opcodes = new Set();
+  let i = 0;
+  while (i < hex.length) {
+    const op = parseInt(hex.substr(i, 2), 16);
+    opcodes.add(op);
+    if (op >= 0x60 && op <= 0x7f) i += (op - 0x5f) * 2;
+    i += 2;
+  }
+  return opcodes;
 }
 
 async function phase4_score(rpc, funded, startBlock, endBlock) {

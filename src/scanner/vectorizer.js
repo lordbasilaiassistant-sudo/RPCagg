@@ -2,20 +2,99 @@
  * Vectorizer — compresses contract analysis into fixed-size feature vectors
  * for neural network training.
  *
- * Each contract becomes a vector of numeric features that captures:
- * - Contract properties (size, age, proxy type)
- * - Financial state (ETH balance, token balances)
- * - Capability fingerprint (which function categories it has)
- * - Activity metrics (if available)
- * - Extraction potential (sim results)
+ * FEATURE_SCHEMA is the single source of truth for all feature dimensions.
+ * Every consumer (model.py, labeler.js, revectorize.js, scorer.js) reads
+ * FEATURE_SCHEMA.length for input_dim instead of hardcoding a number.
  *
- * Output: JSONL where each line is { address, features: number[], labels: {} }
+ * Output: JSONL where first line is { _schema: version, dim: N }
+ * and remaining lines are { address, features: number[], labels: {} }
  */
 
 const fs = require('fs');
 const path = require('path');
 const { makeLogger } = require('../logger');
 const log = makeLogger('vectorizer');
+
+// =========================================================================
+// FEATURE_SCHEMA — the authoritative registry.
+// Every feature has: index, name, group, type.
+//   type: 'binary' (0 or 1), 'normalized' (0-1 continuous), 'encoded' (categorical float)
+//   group: used by model.py for FeatureGroupEncoder slicing
+//
+// To add a new feature: append to this array, bump SCHEMA_VERSION.
+// The model reads FEATURE_SCHEMA.length — no hardcoded dims anywhere.
+// =========================================================================
+
+const SCHEMA_VERSION = '3.0.0'; // 1.0=35-dim, 2.0=38-dim, 3.0=50-dim
+
+const FEATURE_SCHEMA = [
+  // --- structural (0-9) ---
+  { index: 0,  name: 'code_size',             group: 'structural',       type: 'normalized' },
+  { index: 1,  name: 'destroyed',             group: 'structural',       type: 'binary' },
+  { index: 2,  name: 'is_proxy',              group: 'structural',       type: 'binary' },
+  { index: 3,  name: 'proxy_type',            group: 'structural',       type: 'encoded' },
+  { index: 4,  name: 'is_factory',            group: 'structural',       type: 'binary' },
+  { index: 5,  name: 'has_selfdestruct',      group: 'structural',       type: 'binary' },
+  { index: 6,  name: 'selector_count',        group: 'structural',       type: 'normalized' },
+  { index: 7,  name: 'extraction_fn_count',   group: 'structural',       type: 'normalized' },
+  { index: 8,  name: 'deploy_gas',            group: 'structural',       type: 'normalized' },
+  { index: 9,  name: 'deploy_block',          group: 'structural',       type: 'normalized' },
+  // --- financial (10-16) ---
+  { index: 10, name: 'eth_balance',           group: 'financial',        type: 'normalized' },
+  { index: 11, name: 'has_eth',               group: 'financial',        type: 'binary' },
+  { index: 12, name: 'weth_balance',          group: 'financial',        type: 'normalized' },
+  { index: 13, name: 'usdc_balance',          group: 'financial',        type: 'normalized' },
+  { index: 14, name: 'usdbc_balance',         group: 'financial',        type: 'normalized' },
+  { index: 15, name: 'dai_balance',           group: 'financial',        type: 'normalized' },
+  { index: 16, name: 'has_tokens',            group: 'financial',        type: 'binary' },
+  // --- capability (17-30) — one per SELECTOR_CATEGORIES entry ---
+  { index: 17, name: 'cap_transfer',          group: 'capability',       type: 'normalized' },
+  { index: 18, name: 'cap_withdraw',          group: 'capability',       type: 'normalized' },
+  { index: 19, name: 'cap_deposit',           group: 'capability',       type: 'normalized' },
+  { index: 20, name: 'cap_swap',              group: 'capability',       type: 'normalized' },
+  { index: 21, name: 'cap_liquidity',         group: 'capability',       type: 'normalized' },
+  { index: 22, name: 'cap_governance',        group: 'capability',       type: 'normalized' },
+  { index: 23, name: 'cap_admin',             group: 'capability',       type: 'normalized' },
+  { index: 24, name: 'cap_emergency',         group: 'capability',       type: 'normalized' },
+  { index: 25, name: 'cap_upgrade',           group: 'capability',       type: 'normalized' },
+  { index: 26, name: 'cap_sweep',             group: 'capability',       type: 'normalized' },
+  { index: 27, name: 'cap_mint',              group: 'capability',       type: 'normalized' },
+  { index: 28, name: 'cap_burn',              group: 'capability',       type: 'normalized' },
+  { index: 29, name: 'cap_pause',             group: 'capability',       type: 'normalized' },
+  { index: 30, name: 'cap_claim',             group: 'capability',       type: 'normalized' },
+  // --- extraction (31-34) ---
+  { index: 31, name: 'sim_success_rate',      group: 'extraction',       type: 'normalized' },
+  { index: 32, name: 'extraction_success_rate', group: 'extraction',     type: 'normalized' },
+  { index: 33, name: 'successful_sims',       group: 'extraction',       type: 'normalized' },
+  { index: 34, name: 'labeled_treasure',      group: 'extraction',       type: 'binary' },
+  // --- transfer_verification (35-37) ---
+  { index: 35, name: 'flat_gas_fraction',     group: 'transfer_verif',   type: 'normalized' },
+  { index: 36, name: 'withdraw_reverts',      group: 'transfer_verif',   type: 'binary' },
+  { index: 37, name: 'caller_balance',        group: 'transfer_verif',   type: 'normalized' },
+  // --- exploit (38-45) — one per analyzeExploitPatterns() detector ---
+  { index: 38, name: 'reinitializable',       group: 'exploit',          type: 'binary' },
+  { index: 39, name: 'metamorphic',           group: 'exploit',          type: 'binary' },
+  { index: 40, name: 'admin_collision',       group: 'exploit',          type: 'binary' },
+  { index: 41, name: 'delegatecall_vuln',     group: 'exploit',          type: 'binary' },
+  { index: 42, name: 'unchecked_return',      group: 'exploit',          type: 'binary' },
+  { index: 43, name: 'txorigin_auth',         group: 'exploit',          type: 'binary' },
+  { index: 44, name: 'unprotected_owner',     group: 'exploit',          type: 'binary' },
+  { index: 45, name: 'abandoned_timelock',    group: 'exploit',          type: 'binary' },
+  // --- ownership (46-49) ---
+  { index: 46, name: 'owner_is_zero',         group: 'ownership',        type: 'binary' },
+  { index: 47, name: 'owner_is_dead',         group: 'ownership',        type: 'binary' },
+  { index: 48, name: 'owner_is_deployer',     group: 'ownership',        type: 'binary' },
+  { index: 49, name: 'deployer_is_dormant',   group: 'ownership',        type: 'binary' },
+];
+
+// Derived constants from schema — computed once, used everywhere.
+const FEATURE_DIM = FEATURE_SCHEMA.length;
+const BINARY_INDICES = FEATURE_SCHEMA.filter(f => f.type === 'binary').map(f => f.index);
+const FEATURE_GROUPS = {};
+for (const f of FEATURE_SCHEMA) {
+  if (!FEATURE_GROUPS[f.group]) FEATURE_GROUPS[f.group] = { start: f.index, end: f.index + 1 };
+  else FEATURE_GROUPS[f.group].end = f.index + 1;
+}
 
 // Feature categories for selector classification
 const SELECTOR_CATEGORIES = {
@@ -42,17 +121,16 @@ const DEAD_ADDRESSES = new Set([
   '0x0000000000000000000000000000000000000001',
 ]);
 
-// Pattern names from analyzeExploitPatterns() output, in exact order.
-// Each result object has { pattern, detected, exploitable, severity }.
+// Pattern names from analyzeExploitPatterns() — order matches exploit features [38-45].
 const EXPLOIT_PATTERN_ORDER = [
-  'reinitialization',         // [0] -> feature 38
-  'metamorphic_create2',      // [1] -> feature 39
-  'admin_slot_collision',     // [2] -> feature 40
-  'delegatecall_user_target', // [3] -> feature 41
-  'unchecked_return',         // [4] -> feature 42
-  'tx_origin_auth',           // [5] -> feature 43
-  'unprotected_owner',        // [6] -> feature 44
-  'abandoned_timelock',       // [7] -> feature 45
+  'reinitialization',
+  'metamorphic_create2',
+  'admin_slot_collision',
+  'delegatecall_user_target',
+  'unchecked_return',
+  'tx_origin_auth',
+  'unprotected_owner',
+  'abandoned_timelock',
 ];
 
 class Vectorizer {
@@ -65,75 +143,73 @@ class Vectorizer {
   vectorize(contract) {
     const features = [];
 
-    // --- Structural features (indices 0-9) ---
-    features.push(normalize(contract.codeSize || 0, 0, 50000));        // 0: code size
-    features.push(contract.destroyed ? 1 : 0);                          // 1: is destroyed
-    features.push(contract.isProxy ? 1 : 0);                            // 2: is proxy
-    features.push(encodeProxyType(contract.proxyType));                  // 3: proxy type
-    features.push(contract.isFactory ? 1 : 0);                          // 4: is factory
-    features.push(contract.hasSelfdestruct ? 1 : 0);                    // 5: has selfdestruct
-    features.push(normalize(contract.selectors?.length || 0, 0, 200));  // 6: selector count
-    features.push(normalize(contract.extractionFunctions?.length || 0, 0, 20)); // 7: extraction fn count
-    features.push(normalize(contract.gasUsed || 0, 0, 30000000));       // 8: deploy gas
-    features.push(normalize(contract.blockNumber || 0, 0, 50000000));   // 9: deploy block (age proxy)
+    // --- Structural features (0-9) ---
+    features.push(normalize(contract.codeSize || 0, 0, 50000));
+    features.push(contract.destroyed ? 1 : 0);
+    features.push(contract.isProxy ? 1 : 0);
+    features.push(encodeProxyType(contract.proxyType));
+    features.push(contract.isFactory ? 1 : 0);
+    features.push(contract.hasSelfdestruct ? 1 : 0);
+    features.push(normalize(contract.selectors?.length || 0, 0, 200));
+    features.push(normalize(contract.extractionFunctions?.length || 0, 0, 20));
+    features.push(normalize(contract.gasUsed || 0, 0, 30000000));
+    features.push(normalize(contract.blockNumber || 0, 0, 50000000));
 
-    // --- Financial features (indices 10-16) ---
+    // --- Financial features (10-16) ---
     const ethBal = contract.ethBalance ? Number(contract.ethBalance) / 1e18 : 0;
-    features.push(logNormalize(ethBal));                                 // 10: ETH balance (log)
-    features.push(ethBal > 0 ? 1 : 0);                                  // 11: has ETH
-
+    features.push(logNormalize(ethBal));
+    features.push(ethBal > 0 ? 1 : 0);
     const tokenBals = contract.tokenBalances || {};
-    features.push(logNormalize(Number(tokenBals.WETH || 0) / 1e18));     // 12: WETH balance
-    features.push(logNormalize(Number(tokenBals.USDC || 0) / 1e6));      // 13: USDC balance
-    features.push(logNormalize(Number(tokenBals.USDbC || 0) / 1e6));     // 14: USDbC balance
-    features.push(logNormalize(Number(tokenBals.DAI || 0) / 1e18));      // 15: DAI balance
-    features.push(Object.keys(tokenBals).length > 0 ? 1 : 0);           // 16: has any tokens
+    features.push(logNormalize(Number(tokenBals.WETH || 0) / 1e18));
+    features.push(logNormalize(Number(tokenBals.USDC || 0) / 1e6));
+    features.push(logNormalize(Number(tokenBals.USDbC || 0) / 1e6));
+    features.push(logNormalize(Number(tokenBals.DAI || 0) / 1e18));
+    features.push(Object.keys(tokenBals).length > 0 ? 1 : 0);
 
-    // --- Capability fingerprint (indices 17-30) ---
-    // For each selector category, what fraction of known selectors does this contract have?
+    // --- Capability fingerprint (17-30) ---
     const sels = new Set(contract.selectors || []);
     for (const [, catSels] of Object.entries(SELECTOR_CATEGORIES)) {
       const matches = catSels.filter(s => sels.has(s)).length;
-      features.push(matches / catSels.length); // 17-30: category coverage [0,1]
+      features.push(matches / catSels.length);
     }
 
-    // --- Extraction sim features (indices 31-34) ---
+    // --- Extraction sim features (31-34) ---
     const sims = contract.simResults || [];
     const simTotal = sims.length;
     const simSuccess = sims.filter(s => s.success).length;
     const simExtraction = sims.filter(s => s.success && SELECTOR_CATEGORIES.withdraw?.includes(s.selector)).length;
-    features.push(simTotal > 0 ? simSuccess / simTotal : 0);            // 31: sim success rate
-    features.push(simTotal > 0 ? simExtraction / simTotal : 0);         // 32: extraction success rate
-    features.push(normalize(simSuccess, 0, 50));                         // 33: successful sims count
-    features.push(contract.treasure ? 1 : 0);                           // 34: labeled as treasure
+    features.push(simTotal > 0 ? simSuccess / simTotal : 0);
+    features.push(simTotal > 0 ? simExtraction / simTotal : 0);
+    features.push(normalize(simSuccess, 0, 50));
+    features.push(contract.treasure ? 1 : 0);
 
-    // --- Transfer verification features (indices 35-37) ---
-    // These help the model detect whether extraction calls actually move value.
+    // --- Transfer verification features (35-37) ---
     const gasEstimates = contract.gasEstimates || [];
     const flatGasCount = gasEstimates.filter(g => g <= 26000).length;
-    features.push(gasEstimates.length > 0 ? flatGasCount / gasEstimates.length : 0); // 35: fraction of calls with flat gas (~21K = view fn)
-    features.push(contract.withdrawRevertsForCaller ? 1 : 0);           // 36: withdraw/exit reverts for our address
-    features.push(logNormalize(contract.callerBalanceInContract || 0));  // 37: our balanceOf() in the contract (log-normalized)
+    features.push(gasEstimates.length > 0 ? flatGasCount / gasEstimates.length : 0);
+    features.push(contract.withdrawRevertsForCaller ? 1 : 0);
+    features.push(logNormalize(contract.callerBalanceInContract || 0));
 
-    // --- Exploit pattern features (indices 38-45) ---
-    // Directly from analyzeExploitPatterns() — 8 vulnerability detectors.
-    // Input: contract.exploitPatterns = array of { pattern, detected, exploitable, severity }
-    // Each feature is 1 if the pattern was detected AND exploitable, 0 otherwise.
+    // --- Exploit pattern features (38-45) ---
     const exploitResults = contract.exploitPatterns || [];
     const exploitMap = new Map(exploitResults.map(r => [r.pattern, r]));
     for (const patternName of EXPLOIT_PATTERN_ORDER) {
       const r = exploitMap.get(patternName);
-      features.push(r && r.detected ? 1 : 0);                           // 38-45: exploit pattern flags
+      features.push(r && r.detected ? 1 : 0);
     }
 
-    // --- Ownership status features (indices 46-49) ---
-    // From solidity-expert storage analysis: who owns this contract?
+    // --- Ownership status features (46-49) ---
     const owner = (contract.owner || '').toLowerCase();
     const deployer = (contract.deployer || '').toLowerCase();
-    features.push(owner === '0x' + '0'.repeat(40) ? 1 : 0);            // 46: owner is zero (renounced — locked forever)
-    features.push(DEAD_ADDRESSES.has(owner) && owner !== '0x' + '0'.repeat(40) ? 1 : 0); // 47: owner is dead (0xdead — locked forever)
-    features.push(owner && deployer && owner === deployer ? 1 : 0);     // 48: owner is deployer (only deployer can extract)
-    features.push(contract.deployerDormant ? 1 : 0);                    // 49: deployer inactive > 6 months
+    features.push(owner === '0x' + '0'.repeat(40) ? 1 : 0);
+    features.push(DEAD_ADDRESSES.has(owner) && owner !== '0x' + '0'.repeat(40) ? 1 : 0);
+    features.push(owner && deployer && owner === deployer ? 1 : 0);
+    features.push(contract.deployerDormant ? 1 : 0);
+
+    // --- Validate dimension matches schema ---
+    if (features.length !== FEATURE_DIM) {
+      throw new Error(`Vectorizer produced ${features.length} features but FEATURE_SCHEMA expects ${FEATURE_DIM}. Schema is out of sync.`);
+    }
 
     // Labels (for supervised training)
     const exploitDetected = exploitResults.some(r => r.detected);
@@ -149,17 +225,13 @@ class Vectorizer {
       treasure: contract.treasure || false,
       ethValue: ethBal,
       proxyType: contract.proxyType || 'none',
-      // Enriched labels from team findings
-      ownershipStatus: classifyOwnership(owner, deployer, contract),
+      ownershipStatus: classifyOwnership(owner, deployer),
       exploitDetected,
       maxExploitSeverity: maxSeverity,
       deployerDormant: !!contract.deployerDormant,
     };
 
     // Raw selector hashes for learned embedding (bag-of-selectors input).
-    // Each 4-byte selector is converted to an integer for the embedding lookup.
-    // This replaces the hardcoded category buckets for the neural net —
-    // the model learns which selector combinations predict value.
     const selectorHashes = (contract.selectors || []).map(s => parseInt(s, 16));
 
     const vector = {
@@ -181,17 +253,25 @@ class Vectorizer {
     return contracts.map(c => this.vectorize(c));
   }
 
-  // Write vectors to JSONL file
+  // Write vectors to JSONL file — first line is schema header
   write(filename = 'vectors.jsonl') {
     const filePath = path.join(this.outputDir, filename);
     const stream = fs.createWriteStream(filePath);
+
+    // Schema header — lets readers verify compatibility
+    stream.write(JSON.stringify({
+      _schema: SCHEMA_VERSION,
+      dim: FEATURE_DIM,
+      features: FEATURE_SCHEMA.map(f => f.name),
+      groups: FEATURE_GROUPS,
+    }) + '\n');
 
     for (const v of this.vectors) {
       stream.write(JSON.stringify(v) + '\n');
     }
 
     stream.end();
-    log.info(`wrote ${this.vectors.length} vectors to ${filePath} (dim=${this.vectors[0]?.dim || 0})`);
+    log.info(`wrote ${this.vectors.length} vectors to ${filePath} (schema=${SCHEMA_VERSION}, dim=${FEATURE_DIM})`);
     return filePath;
   }
 
@@ -203,7 +283,8 @@ class Vectorizer {
 
     return {
       totalVectors: this.vectors.length,
-      dimensions: this.vectors[0]?.dim || 0,
+      dimensions: FEATURE_DIM,
+      schemaVersion: SCHEMA_VERSION,
       withValue,
       withExtraction,
       treasures,
@@ -219,8 +300,7 @@ function normalize(val, min, max) {
 
 // Log normalize for financial values (handles extreme range).
 // Divisor=6 maps the practical range [0, 1M] to [0, 1] with good separation
-// in the critical 1-1000 ETH band. Previous divisor=10 wasted half the output
-// range on values that don't exist (>10B), compressing all real values into [0, 0.54].
+// in the critical 1-1000 ETH band.
 function logNormalize(val) {
   if (val <= 0) return 0;
   return Math.min(1, Math.log10(val + 1) / 6);
@@ -233,11 +313,20 @@ function encodeProxyType(type) {
 }
 
 // Classify ownership status for enriched labels
-function classifyOwnership(owner, deployer, contract) {
+function classifyOwnership(owner, deployer) {
   if (!owner || owner === '0x' + '0'.repeat(40)) return 'renounced';
   if (DEAD_ADDRESSES.has(owner)) return 'burned';
   if (owner && deployer && owner === deployer) return 'deployer_owned';
   return 'other';
 }
 
-module.exports = { Vectorizer, SELECTOR_CATEGORIES, DEAD_ADDRESSES };
+module.exports = {
+  Vectorizer,
+  FEATURE_SCHEMA,
+  FEATURE_DIM,
+  FEATURE_GROUPS,
+  BINARY_INDICES,
+  SCHEMA_VERSION,
+  SELECTOR_CATEGORIES,
+  DEAD_ADDRESSES,
+};
